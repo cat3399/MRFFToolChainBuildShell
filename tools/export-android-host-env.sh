@@ -42,7 +42,27 @@ export -f my_sed_i
 
 case "$OSTYPE" in
   darwin*)  HOST_TAG="darwin-x86_64"; export -f install_depends ;;
-  linux*)   HOST_TAG="linux-x86_64" ;;
+  linux*)
+    HOST_TAG="linux-x86_64"
+    function install_depends() {
+        local name="$1"
+
+        if command -v "$name" >/dev/null 2>&1; then
+            local ver
+            ver="$("$name" --version 2>/dev/null | head -n 1 || true)"
+            if [[ -n "$ver" ]]; then
+                echo "[✅] ${name}: ${ver}"
+            else
+                echo "[✅] ${name}: installed"
+            fi
+            return 0
+        fi
+
+        echo "❌ missing depends bin: ${name}" >&2
+        return 1
+    }
+    export -f install_depends
+  ;;
   msys)
     case "$(uname -m)" in
       x86_64) HOST_TAG="windows-x86_64" ;;

@@ -23,6 +23,9 @@ export LIPO_LIBS="libavcodec libavformat libavutil libswscale libswresample liba
 export LIB_DEPENDS_BIN="nasm pkg-config"
 export GIT_LOCAL_REPO=extra/ijkffmpeg
 export REPO_DIR=ijkffmpeg
+# Apply local patches on top of bilibili/FFmpeg tag (ff4.0--ijk0.8.8--20210426--001).
+# Keep this directory minimal to avoid conflicts with upstream ijk patches.
+export PATCH_DIR=ijkffmpeg-n4.0
 
 # you can export GIT_IJKFFMPEG_UPSTREAM=git@xx:yy/FFmpeg.git use your mirror
 if [[ "$GIT_IJKFFMPEG_UPSTREAM" != "" ]] ;then
@@ -44,4 +47,3 @@ export PRE_COMPILE_TAG_ANDROID=ijkffmpeg-4.0-251216211157
 export PRE_COMPILE_TAG_TVOS=ijkffmpeg-4.0-251216134050
 export PRE_COMPILE_TAG_MACOS=ijkffmpeg-4.0-251216134050
 export PRE_COMPILE_TAG_IOS=ijkffmpeg-4.0-251216134050
-

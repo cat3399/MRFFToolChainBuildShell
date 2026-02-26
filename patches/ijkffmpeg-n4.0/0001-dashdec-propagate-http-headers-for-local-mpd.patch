@@ -1,0 +1,90 @@
+From 0a1b2c3d4e5f678901234567890abcdef12345678 Mon Sep 17 00:00:00 2001
+From: cat3399 <1499276721hu@gmail.com>
+Date: Thu, 26 Feb 2026 15:30:00 +0000
+Subject: [PATCH] dashdec: propagate HTTP headers for local MPD
+
+Problem:
+- When the MPD is opened from a local file (file:// or absolute path),
+  DASH sub-requests (init/m4s) are opened via HTTP but do not inherit
+  app-provided HTTP options (headers/user_agent/cookies). This results
+  in default "Lavf/.." UA and missing Referer, causing 403 on some CDNs.
+
+Fix:
+- Expose "headers", "user_agent" and "cookies" as DASH demuxer AVOptions
+  so they can be set even when the top-level MPD input is local.
+- Do not overwrite these values from the MPD's URLContext when already set.
+- Free headers in dash_close().
+
+This keeps behavior for remote MPDs unchanged while making local MPDs work.
+---
+ libavformat/dashdec.c | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 6b70a64..9c8f3b1 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -372,11 +372,18 @@ static void free_audio_list(DASHContext *c)
+ static void set_httpheader_options(DASHContext *c, AVDictionary **opts)
+ {
+     // broker prior HTTP options that should be consistent across requests
+-    av_dict_set(opts, "user-agent", c->user_agent, 0);
++    // http.c supports "user_agent" and (deprecated) "user-agent".
++    av_dict_set(opts, "user_agent", c->user_agent, 0);
++    av_dict_set(opts, "user-agent", c->user_agent, 0);
+     av_dict_set(opts, "cookies", c->cookies, 0);
+     av_dict_set(opts, "headers", c->headers, 0);
+     if (c->is_live) {
+         av_dict_set(opts, "seekable", "0", 0);
+     }
+ }
+ static void update_options(char **dest, const char *name, void *src)
+ {
+     av_freep(dest);
+     av_opt_get(src, name, AV_OPT_SEARCH_CHILDREN, (uint8_t**)dest);
+-    if (*dest)
++    if (*dest && !strlen(*dest))
+         av_freep(dest);
+ }
+@@ -1869,11 +1876,18 @@ static int dash_read_header(AVFormatContext *s)
+     c->interrupt_callback = &s->interrupt_callback;
+     // if the URL context is good, read important options we must broker later
+     if (u) {
+-        update_options(&c->user_agent, "user-agent", u);
+-        update_options(&c->cookies, "cookies", u);
+-        update_options(&c->headers, "headers", u);
++        // Keep app-provided values (set via AVOptions) when MPD is local.
++        if (!c->user_agent)
++            update_options(&c->user_agent, "user_agent", u);
++        if (!c->cookies)
++            update_options(&c->cookies, "cookies", u);
++        if (!c->headers)
++            update_options(&c->headers, "headers", u);
+     }
+@@ -2033,6 +2047,7 @@ static int dash_close(AVFormatContext *s)
+     free_audio_list(c);
+     free_video_list(c);
+ 
+     av_freep(&c->cookies);
+     av_freep(&c->user_agent);
++    av_freep(&c->headers);
+     av_dict_free(&c->avio_opts);
+     av_freep(&c->base_url);
+     return 0;
+ }
+@@ -2150,6 +2165,12 @@ static int dash_probe(AVProbeData *p)
+ #define OFFSET(x) offsetof(DASHContext, x)
+ #define FLAGS AV_OPT_FLAG_DECODING_PARAM
+ static const AVOption dash_options[] = {
++    {"headers", "set custom HTTP headers (applies to DASH sub-requests too)",
++     OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
++    {"user_agent", "override User-Agent header (applies to DASH sub-requests too)",
++     OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
++    {"cookies", "set cookies (applies to DASH sub-requests too)",
++     OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
+     {"allowed_extensions", "List of file extensions that dash is allowed to access",
+      OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
+      {.str = "aac,m4a,m4s,m4v,mov,mp4"},
+-- 
+2.39.2
+

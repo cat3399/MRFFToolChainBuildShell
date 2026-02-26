@@ -93,6 +93,18 @@ else
     echo "[❌] --disable-openssl"
 fi
 
+# MPEG-DASH MPD demuxer depends on libxml2.
+# This build script previously didn't opt-in dash/libxml2 (it doesn't source auto-detect-third-libs.sh),
+# so debugly's released AAR often ends up without MPEG-DASH support.
+pkg-config --libs libxml-2.0 --silence-errors >/dev/null && enable_xml2=1
+
+if [[ $enable_xml2 ]];then
+    echo "[✅] --enable-demuxer=dash --enable-libxml2 : $(pkg-config --modversion libxml-2.0)"
+    FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-demuxer=dash --enable-libxml2"
+else
+    echo "[❌] --disable-demuxer=dash --disable-libxml2"
+fi
+
 #--------------------
 echo "--------------------"
 echo "[*] configure"

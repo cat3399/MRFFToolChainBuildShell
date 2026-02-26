@@ -54,8 +54,11 @@ index 6b70a64..9c8f3b1 100644
 -        update_options(&c->cookies, "cookies", u);
 -        update_options(&c->headers, "headers", u);
 +        // Keep app-provided values (set via AVOptions) when MPD is local.
-+        if (!c->user_agent)
++        if (!c->user_agent) {
 +            update_options(&c->user_agent, "user_agent", u);
++            if (!c->user_agent)
++                update_options(&c->user_agent, "user-agent", u);
++        }
 +        if (!c->cookies)
 +            update_options(&c->cookies, "cookies", u);
 +        if (!c->headers)
@@ -87,4 +90,3 @@ index 6b70a64..9c8f3b1 100644
       {.str = "aac,m4a,m4s,m4v,mov,mp4"},
 -- 
 2.39.2
-

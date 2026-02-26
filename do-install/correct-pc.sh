@@ -41,6 +41,20 @@ function correct_pc_file(){
         my_sed_i "s|^includedir=[^$].*include|includedir=$include_dir|" "$pc"
         my_sed_i "s|-L/[^ ]*lib|-L$lib_dir|" "$pc"
         my_sed_i "s|-I/[^ ]*include|-I$include_dir|" "$pc"
+
+        # libxml2: some projects (FFmpeg) check headers via:
+        #   #include <libxml2/libxml/xmlversion.h>
+        # while libxml2's pkg-config usually emits:
+        #   -I${includedir}/libxml2
+        # Create a compat symlink so both include styles work:
+        #   <base>/include/libxml2/libxml2 -> <base>/include/libxml2
+        if [[ "$(basename "$pc")" == "libxml-2.0.pc" ]]; then
+            local xml2_include="${include_dir}/libxml2"
+            if [[ -d "$xml2_include" && ! -e "${xml2_include}/libxml2" ]]; then
+                ln -s . "${xml2_include}/libxml2"
+                echo "[✅] fix xml2 headers: ${xml2_include}/libxml2 -> ."
+            fi
+        fi
     done
     
     cd "$dir"

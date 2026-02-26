@@ -86,6 +86,12 @@ function apply_patches() {
     if [[ -d "$patch_dir" ]]; then
         echo
         echo "== Applying patches: $(basename $patch_dir) → $(basename $PWD) =="
+        # `git am` requires a committer identity.
+        # Some CI environments (e.g. GitHub Actions runners) may not have it configured.
+        if [[ -z "$(git config user.name 2>/dev/null)" || -z "$(git config user.email 2>/dev/null)" ]]; then
+            git config user.name "${MR_GIT_COMMITTER_NAME:-FFToolChain}"
+            git config user.email "${MR_GIT_COMMITTER_EMAIL:-fftoolchain@localhost}"
+        fi
         git am --whitespace=fix --keep $patch_dir/*.patch
         if [[ $? -ne 0 ]]; then
             echo 'Apply patches failed!'

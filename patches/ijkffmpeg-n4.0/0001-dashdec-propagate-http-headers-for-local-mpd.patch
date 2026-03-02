@@ -4,8 +4,8 @@ Date: Thu, 26 Feb 2026 10:42:04 +0000
 Subject: [PATCH] dashdec: keep HTTP headers for local MPD
 
 ---
- libavformat/dashdec.c | 24 ++++++++++++++++++++----
- 1 file changed, 20 insertions(+), 4 deletions(-)
+ libavformat/dashdec.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
 index 8bfde4d..2b33881 100644
@@ -57,13 +57,15 @@ index 8bfde4d..2b33881 100644
      av_dict_free(&c->avio_opts);
      av_freep(&c->base_url);
      return 0;
-@@ -2150,6 +2160,12 @@ static int dash_probe(AVProbeData *p)
+@@ -2150,6 +2160,14 @@ static int dash_probe(AVProbeData *p)
  #define OFFSET(x) offsetof(DASHContext, x)
  #define FLAGS AV_OPT_FLAG_DECODING_PARAM
  static const AVOption dash_options[] = {
 +    {"headers", "set custom HTTP headers (applies to DASH sub-requests too)",
 +        OFFSET(headers), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
 +    {"user_agent", "override User-Agent header (applies to DASH sub-requests too)",
++        OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
++    {"user-agent", "override User-Agent header (alias for user_agent)",
 +        OFFSET(user_agent), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},
 +    {"cookies", "set cookies (applies to DASH sub-requests too)",
 +        OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS},

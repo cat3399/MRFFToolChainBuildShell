@@ -1,0 +1,164 @@
+From 4f1db0e8f673d714f712f47dba3eb3c95b4d6d2a Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Sun, 19 Apr 2026 16:28:00 +0800
+Subject: [PATCH] dashdec: enable seekable single-file VOD inputs
+
+---
+ libavformat/dashdec.c | 119 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 117 insertions(+), 2 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 8bfde4d..6c33fa2 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1642,11 +1642,121 @@ static int update_init_section(struct representation *pls)
+     return 0;
+ }
+ 
++static int ensure_media_input(struct representation *v)
++{
++    DASHContext *c = v->parent->priv_data;
++    int ret;
++
++    if (v->input)
++        return 0;
++
++    if (!v->cur_seg) {
++        v->cur_seg = get_current_fragment(v);
++        if (!v->cur_seg)
++            return AVERROR_EOF;
++    }
++
++    ret = update_init_section(v);
++    if (ret < 0)
++        return ret;
++
++    return open_input(c, v, v->cur_seg);
++}
++
++static int64_t get_virtual_stream_size(struct representation *v)
++{
++    int64_t media_size = -1;
++
++    if (v->cur_seg_size >= 0) {
++        media_size = v->cur_seg_size;
++    } else if (v->cur_seg && v->cur_seg->size >= 0) {
++        media_size = v->cur_seg->size;
++    } else if (v->input) {
++        media_size = avio_size(v->input);
++    }
++
++    if (media_size < 0)
++        return media_size;
++
++    return (int64_t)v->init_sec_data_len + media_size;
++}
++
++static int64_t get_virtual_stream_position(struct representation *v)
++{
++    if (v->init_sec_data_len && v->init_sec_buf_read_offset < v->init_sec_data_len)
++        return v->init_sec_buf_read_offset;
++
++    if (v->cur_seg_offset < 0)
++        return AVERROR(EINVAL);
++
++    return (int64_t)v->init_sec_data_len + v->cur_seg_offset;
++}
++
+ static int64_t seek_data(void *opaque, int64_t offset, int whence)
+ {
+     struct representation *v = opaque;
+-    if (v->n_fragments && !v->init_sec_data_len) {
+-        return avio_seek(v->input, offset, whence);
++    int64_t current_pos;
++    int64_t stream_size;
++    int64_t media_offset;
++    int64_t seek_ret;
++    int ret;
++
++    if (!v->n_fragments)
++        return AVERROR(ENOSYS);
++
++    if (whence == AVSEEK_SIZE)
++        return get_virtual_stream_size(v);
++
++    current_pos = get_virtual_stream_position(v);
++    if (current_pos < 0)
++        return current_pos;
++
++    switch (whence) {
++    case SEEK_SET:
++        break;
++    case SEEK_CUR:
++        offset += current_pos;
++        break;
++    case SEEK_END:
++        stream_size = get_virtual_stream_size(v);
++        if (stream_size < 0)
++            return AVERROR(ENOSYS);
++        offset += stream_size;
++        break;
++    default:
++        return AVERROR(EINVAL);
++    }
++
++    if (offset < 0)
++        return AVERROR(EINVAL);
++
++    if (v->init_sec_data_len && offset < v->init_sec_data_len) {
++        v->init_sec_buf_read_offset = offset;
++        if (v->input) {
++            seek_ret = avio_seek(v->input, 0, SEEK_SET);
++            if (seek_ret < 0)
++                return seek_ret;
++            v->cur_seg_offset = 0;
++        }
++        av_log(v->parent, AV_LOG_VERBOSE, "DASH virtual seek -> init offset %"PRId64", playlist %d\n",
++               offset, v->rep_idx);
++        return offset;
++    }
++
++    ret = ensure_media_input(v);
++    if (ret < 0)
++        return ret;
++
++    v->init_sec_buf_read_offset = v->init_sec_data_len;
++    media_offset = offset - v->init_sec_data_len;
++    seek_ret = avio_seek(v->input, media_offset, SEEK_SET);
++    if (seek_ret < 0)
++        return seek_ret;
++    v->cur_seg_offset = seek_ret;
++    av_log(v->parent, AV_LOG_VERBOSE,
++           "DASH virtual seek -> media offset %"PRId64" (virtual %"PRId64"), playlist %d\n",
++           seek_ret, (int64_t)v->init_sec_data_len + seek_ret, v->rep_idx);
++    return (int64_t)v->init_sec_data_len + seek_ret;
+     }
+ 
+     return AVERROR(ENOSYS);
+@@ -1788,7 +1871,10 @@ static int open_demux_for_component(AVFormatContext *s, struct representation *p
+     } else {
+         ffio_init_context(&pls->pb, avio_ctx_buffer , INITIAL_BUFFER_SIZE, 0, pls, read_data, NULL, seek_data);
+     }
+-    pls->pb.seekable = 0;
++    /* Single-file VOD relies on the child demuxer seeking inside the custom IO. */
++    pls->pb.seekable = (!c->is_live && pls->n_fragments == 1)
++                       ? AVIO_SEEKABLE_NORMAL
++                       : 0;
+ 
+     if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0)
+         goto fail;
+@@ -2056,7 +2145,11 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
+         if (dry_run)
+             return 0;
+         ff_read_frame_flush(pls->ctx);
+-        return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
++        ret = av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
++        av_log(pls->parent, ret < 0 ? AV_LOG_WARNING : AV_LOG_VERBOSE,
++               "DASH single-fragment child seek ret=%d, playlist %d\n",
++               ret, pls->rep_idx);
++        return ret;
+     }
+ 
+     if (pls->input)
+-- 
+2.34.1

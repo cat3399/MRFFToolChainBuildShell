@@ -1,17 +1,17 @@
-From 4f1db0e8f673d714f712f47dba3eb3c95b4d6d2a Mon Sep 17 00:00:00 2001
+From 31d741b3e42ddcdf24c5b59ce38c3ede73d8d779 Mon Sep 17 00:00:00 2001
 From: FFToolChain <fftoolchain@localhost>
-Date: Sun, 19 Apr 2026 16:28:00 +0800
+Date: Sun, 19 Apr 2026 16:01:50 +0800
 Subject: [PATCH] dashdec: enable seekable single-file VOD inputs
 
 ---
- libavformat/dashdec.c | 119 +++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 117 insertions(+), 2 deletions(-)
+ libavformat/dashdec.c | 127 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 122 insertions(+), 5 deletions(-)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
-index 8bfde4d..6c33fa2 100644
+index e20c149..58d19cb 100644
 --- a/libavformat/dashdec.c
 +++ b/libavformat/dashdec.c
-@@ -1642,11 +1642,121 @@ static int update_init_section(struct representation *pls)
+@@ -1644,12 +1644,122 @@ static int update_init_section(struct representation *pls)
      return 0;
  }
  
@@ -70,6 +70,7 @@ index 8bfde4d..6c33fa2 100644
      struct representation *v = opaque;
 -    if (v->n_fragments && !v->init_sec_data_len) {
 -        return avio_seek(v->input, offset, whence);
+-    }
 +    int64_t current_pos;
 +    int64_t stream_size;
 +    int64_t media_offset;
@@ -113,7 +114,8 @@ index 8bfde4d..6c33fa2 100644
 +                return seek_ret;
 +            v->cur_seg_offset = 0;
 +        }
-+        av_log(v->parent, AV_LOG_VERBOSE, "DASH virtual seek -> init offset %"PRId64", playlist %d\n",
++        av_log(v->parent, AV_LOG_VERBOSE,
++               "DASH virtual seek -> init offset %"PRId64", playlist %d\n",
 +               offset, v->rep_idx);
 +        return offset;
 +    }
@@ -132,10 +134,10 @@ index 8bfde4d..6c33fa2 100644
 +           "DASH virtual seek -> media offset %"PRId64" (virtual %"PRId64"), playlist %d\n",
 +           seek_ret, (int64_t)v->init_sec_data_len + seek_ret, v->rep_idx);
 +    return (int64_t)v->init_sec_data_len + seek_ret;
-     }
  
      return AVERROR(ENOSYS);
-@@ -1788,7 +1871,10 @@ static int open_demux_for_component(AVFormatContext *s, struct representation *p
+ }
+@@ -1790,7 +1900,10 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
      } else {
          ffio_init_context(&pls->pb, avio_ctx_buffer , INITIAL_BUFFER_SIZE, 0, pls, read_data, NULL, seek_data);
      }
@@ -147,7 +149,7 @@ index 8bfde4d..6c33fa2 100644
  
      if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0)
          goto fail;
-@@ -2056,7 +2145,11 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
+@@ -2067,7 +2180,11 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
          if (dry_run)
              return 0;
          ff_read_frame_flush(pls->ctx);
@@ -161,4 +163,4 @@ index 8bfde4d..6c33fa2 100644
  
      if (pls->input)
 -- 
-2.34.1
+2.50.1 (Apple Git-155)

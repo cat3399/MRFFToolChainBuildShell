@@ -1,0 +1,109 @@
+From 0031cdce727853873639853db92eb3df0abd7a19 Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Tue, 28 Apr 2026 19:33:55 +0800
+Subject: [PATCH] dashdec: preserve escaped BaseURL queries
+
+---
+ libavformat/dashdec.c | 50 +++++++++++++++++++++++++++++++++++--------
+ 1 file changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index b193f4c74b..7e44c2dd51 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -828,6 +828,22 @@ static int parse_manifest_segmenttimeline(AVFormatContext *s, struct representat
+     return 0;
+ }
+ 
++static int set_content_path(xmlNodePtr node, const char *text)
++{
++    xmlChar *escaped;
++
++    if (!node || !text)
++        return AVERROR_INVALIDDATA;
++
++    escaped = xmlEncodeSpecialChars(node->doc, (const xmlChar *)text);
++    if (!escaped)
++        return AVERROR(ENOMEM);
++
++    xmlNodeSetContent(node, escaped);
++    xmlFree(escaped);
++    return 0;
++}
++
+ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_url_size, xmlNodePtr *baseurl_nodes, int n_baseurl_nodes) {
+ 
+     char *tmp_str = NULL;
+@@ -836,6 +852,7 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
+     xmlNodePtr node = NULL;
+     char *baseurl = NULL;
+     char *root_url = NULL;
++    char *root_url_buf = NULL;
+     char *text = NULL;
+ 
+     int isRootHttp = 0;
+@@ -889,18 +906,26 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
+ 
+     node = baseurl_nodes[rootId];
+     baseurl = xmlNodeGetContent(node);
+-    root_url = (av_strcasecmp(baseurl, "")) ? baseurl : path;
++    root_url = (baseurl && av_strcasecmp(baseurl, "")) ? baseurl : path;
++    root_url_buf = av_mallocz(tmp_max_url_size);
++    if (!root_url_buf) {
++        updated = AVERROR(ENOMEM);
++        goto end;
++    }
++    av_strlcpy(root_url_buf, root_url, tmp_max_url_size);
+     if (node) {
+-        xmlNodeSetContent(node, root_url);
++        updated = set_content_path(node, root_url_buf);
++        if (updated < 0)
++            goto end;
+         updated = 1;
+     }
+ 
+-    size = strlen(root_url);
+-    isRootHttp = ishttp(root_url);
++    size = strlen(root_url_buf);
++    isRootHttp = ishttp(root_url_buf);
+ 
+-    if (root_url[size - 1] != token) {
+-        av_strlcat(root_url, "/", size + 2);
+-        size += 2;
++    if (size && root_url_buf[size - 1] != token) {
++        av_strlcat(root_url_buf, "/", tmp_max_url_size);
++        size = strlen(root_url_buf);
+     }
+ 
+     for (i = 0; i < n_baseurl_nodes; ++i) {
+@@ -911,11 +936,15 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
+         if (text) {
+             memset(tmp_str, 0, strlen(tmp_str));
+             if (!ishttp(text) && isRootHttp) {
+-                av_strlcpy(tmp_str, root_url, size + 1);
++                av_strlcpy(tmp_str, root_url_buf, tmp_max_url_size);
+             }
+             start = (text[0] == token);
+             av_strlcat(tmp_str, text + start, tmp_max_url_size);
+-            xmlNodeSetContent(baseurl_nodes[i], tmp_str);
++            updated = set_content_path(baseurl_nodes[i], tmp_str);
++            if (updated < 0) {
++                xmlFree(text);
++                goto end;
++            }
+             updated = 1;
+             xmlFree(text);
+         }
+@@ -927,6 +956,9 @@ end:
+     }
+     av_free(path);
+     av_free(tmp_str);
++    av_free(root_url_buf);
++    if (baseurl)
++        xmlFree(baseurl);
+     return updated;
+ 
+ }
+-- 
+2.50.1 (Apple Git-155)
+

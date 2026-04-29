@@ -1,0 +1,93 @@
+From 6c5f2a73b9f6ebd4d07d05dff0b34f6b4a73fcb4 Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Wed, 29 Apr 2026 14:20:00 +0800
+Subject: [PATCH] dashdec: retry SegmentBase short EOF reads
+
+---
+ libavformat/dashdec.c | 64 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 628cedc050..6ad0f5cfa0 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1980,6 +1980,59 @@ static int64_t seek_data(void *opaque, int64_t offset, int whence)
+     return AVERROR(ENOSYS);
+ }
+ 
++static int retry_segmentbase_short_eof(struct representation *v)
++{
++    DASHContext *c = v->parent->priv_data;
++    int64_t media_size;
++    int64_t media_offset;
++    int64_t absolute_offset;
++    int64_t original_url_offset;
++    int64_t original_seg_size;
++    int ret;
++
++    if (c->is_live || !v->input || !v->cur_seg || v->n_fragments != 1)
++        return AVERROR_EOF;
++
++    if (!v->init_sec_data_len || v->cur_seg->url_offset <= 0)
++        return AVERROR_EOF;
++
++    media_offset = v->cur_seg_offset;
++    if (media_offset < 0)
++        return AVERROR(EINVAL);
++
++    media_size = get_media_stream_size(v);
++    if (media_size < 0 || media_offset >= media_size)
++        return AVERROR_EOF;
++
++    absolute_offset = v->cur_seg->url_offset + media_offset;
++    ret = avio_seek(v->input, absolute_offset, SEEK_SET);
++    if (ret >= 0) {
++        av_log(v->parent, AV_LOG_WARNING,
++               "DASH SegmentBase short EOF, resume media offset %"PRId64"/%"PRId64" absolute %"PRId64", playlist %d\n",
++               media_offset, media_size, absolute_offset, v->rep_idx);
++        return 0;
++    }
++
++    ff_format_io_close(v->parent, &v->input);
++    original_url_offset = v->cur_seg->url_offset;
++    original_seg_size = v->cur_seg->size;
++    v->cur_seg->url_offset = absolute_offset;
++    v->cur_seg->size = media_size - media_offset;
++
++    ret = open_input(c, v, v->cur_seg);
++
++    v->cur_seg->url_offset = original_url_offset;
++    v->cur_seg->size = original_seg_size;
++    v->cur_seg_offset = media_offset;
++    v->cur_seg_size = original_seg_size;
++
++    av_log(v->parent, AV_LOG_WARNING,
++           "DASH SegmentBase short EOF, reopen ret=%d media offset %"PRId64"/%"PRId64" absolute %"PRId64", playlist %d\n",
++           ret, media_offset, media_size, absolute_offset, v->rep_idx);
++
++    return ret;
++}
++
+ static int read_data(void *opaque, uint8_t *buf, int buf_size)
+ {
+     int ret = 0;
+@@ -2025,6 +2075,17 @@ restart:
+     ret = read_from_url(v, v->cur_seg, buf, buf_size, READ_NORMAL);
+     if (ret > 0)
+         goto end;
++    if (ret == 0 || ret == AVERROR_EOF) {
++        ret = retry_segmentbase_short_eof(v);
++        if (ret == 0) {
++            ret = read_from_url(v, v->cur_seg, buf, buf_size, READ_NORMAL);
++            if (ret > 0)
++                goto end;
++        }
++        if (ret == AVERROR_EOF)
++            ret = 0;
++        goto end;
++    }
+ 
+     if (c->is_live || v->cur_seq_no < v->last_seq_no) {
+         if (!v->is_restart_needed)
+-- 
+2.50.1 (Apple Git-155)

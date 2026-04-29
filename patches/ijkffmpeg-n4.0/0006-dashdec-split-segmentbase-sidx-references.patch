@@ -1,14 +1,14 @@
-From 0360c3f472f3ee82ea1a7ea1cb4bc82cf4b5dcfb Mon Sep 17 00:00:00 2001
+From 5396c566515a06eecb9689a8cc275a81bc2d7820 Mon Sep 17 00:00:00 2001
 From: FFToolChain <fftoolchain@localhost>
-Date: Wed, 29 Apr 2026 14:31:22 +0800
+Date: Wed, 29 Apr 2026 19:44:21 +0800
 Subject: [PATCH] dashdec: split SegmentBase sidx references
 
 ---
- libavformat/dashdec.c | 228 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 228 insertions(+)
+ libavformat/dashdec.c | 227 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 227 insertions(+)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
-index f45a548..548d656 100644
+index f8aceca..0ca76ff 100644
 --- a/libavformat/dashdec.c
 +++ b/libavformat/dashdec.c
 @@ -321,6 +321,31 @@ static void free_fragment_list(struct representation *pls)
@@ -229,7 +229,7 @@ index f45a548..548d656 100644
  static int parse_manifest_segmentbase(AVFormatContext *s, struct representation *rep,
                                        xmlNodePtr segmentbase_node,
                                        xmlNodePtr *baseurl_nodes,
-@@ -1822,6 +2026,30 @@ static int update_init_section(struct representation *pls)
+@@ -1822,6 +2026,29 @@ static int update_init_section(struct representation *pls)
  
      pls->init_sec_data_len = ret;
      pls->init_sec_buf_read_offset = 0;
@@ -249,7 +249,6 @@ index f45a548..548d656 100644
 +                       "DASH SegmentBase trimmed sidx from init section len=%d, playlist %d\n",
 +                       sidx_offset, pls->rep_idx);
 +            }
-+            pls->pb.seekable = pls->n_fragments == 1 ? AVIO_SEEKABLE_NORMAL : 0;
 +            free_fragment(&old_cur);
 +            pls->cur_seg = NULL;
 +            ret = clone_fragment(&pls->cur_seg, pls->fragments[pls->cur_seq_no]);
@@ -262,3 +261,4 @@ index f45a548..548d656 100644
  }
 -- 
 2.50.1 (Apple Git-155)
+

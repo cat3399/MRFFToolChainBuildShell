@@ -4,8 +4,8 @@ Date: Wed, 29 Apr 2026 14:31:22 +0800
 Subject: [PATCH] dashdec: split SegmentBase sidx references
 
 ---
- libavformat/dashdec.c | 213 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 213 insertions(+)
+ libavformat/dashdec.c | 228 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 228 insertions(+)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
 index f45a548..548d656 100644
@@ -43,17 +43,21 @@ index f45a548..548d656 100644
  static void free_timelines_list(struct representation *pls)
  {
      int i;
-@@ -612,6 +637,179 @@ static int64_t get_fragment_end_offset(struct fragment *seg)
+@@ -612,6 +637,185 @@ static int64_t get_fragment_end_offset(struct fragment *seg)
      return seg->url_offset + seg->size - 1;
  }
  
 +static int parse_segmentbase_sidx(AVFormatContext *s, struct representation *rep,
 +                                  struct fragment *media,
-+                                  const uint8_t *data, int data_size)
++                                  const uint8_t *data, int data_size,
++                                  int *sidx_offset)
 +{
 +    const uint8_t *p = data;
 +    const uint8_t *end = data + data_size;
 +    int parsed = 0;
++
++    if (sidx_offset)
++        *sidx_offset = -1;
 +
 +    if (!rep || !media || !data || data_size < 8)
 +        return 0;
@@ -94,6 +98,8 @@ index f45a548..548d656 100644
 +            p += box_size;
 +            continue;
 +        }
++        if (sidx_offset)
++            *sidx_offset = p - data;
 +
 +        box = p;
 +        q = box + header_size;
@@ -223,17 +229,26 @@ index f45a548..548d656 100644
  static int parse_manifest_segmentbase(AVFormatContext *s, struct representation *rep,
                                        xmlNodePtr segmentbase_node,
                                        xmlNodePtr *baseurl_nodes,
-@@ -1822,6 +2020,21 @@ static int update_init_section(struct representation *pls)
+@@ -1822,6 +2026,30 @@ static int update_init_section(struct representation *pls)
  
      pls->init_sec_data_len = ret;
      pls->init_sec_buf_read_offset = 0;
 +    if (pls->n_fragments == 1 && pls->fragments[0] && pls->fragments[0]->url_offset > 0) {
 +        struct fragment *old_cur = pls->cur_seg;
++        int sidx_offset = -1;
 +        ret = parse_segmentbase_sidx(pls->parent, pls, pls->fragments[0],
-+                                     pls->init_sec_buf, pls->init_sec_data_len);
++                                     pls->init_sec_buf, pls->init_sec_data_len,
++                                     &sidx_offset);
 +        if (ret < 0)
 +            return ret;
 +        if (ret > 0) {
++            if (sidx_offset > 0 && sidx_offset < pls->init_sec_data_len) {
++                pls->init_sec_data_len = sidx_offset;
++                pls->init_sec_buf_read_offset = 0;
++                av_log(pls->parent, AV_LOG_VERBOSE,
++                       "DASH SegmentBase trimmed sidx from init section len=%d, playlist %d\n",
++                       sidx_offset, pls->rep_idx);
++            }
 +            pls->pb.seekable = pls->n_fragments == 1 ? AVIO_SEEKABLE_NORMAL : 0;
 +            free_fragment(&old_cur);
 +            pls->cur_seg = NULL;
@@ -247,4 +262,3 @@ index f45a548..548d656 100644
  }
 -- 
 2.50.1 (Apple Git-155)
-

@@ -4,14 +4,14 @@ Date: Wed, 29 Apr 2026 14:20:00 +0800
 Subject: [PATCH] dashdec: retry SegmentBase short EOF reads
 
 ---
- libavformat/dashdec.c | 64 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 64 insertions(+)
+ libavformat/dashdec.c | 65 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 65 insertions(+)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
 index 628cedc050..6ad0f5cfa0 100644
 --- a/libavformat/dashdec.c
 +++ b/libavformat/dashdec.c
-@@ -1980,6 +1980,59 @@ static int64_t seek_data(void *opaque, int64_t offset, int whence)
+@@ -1980,6 +1980,60 @@ static int64_t seek_data(void *opaque, int64_t offset, int whence)
      return AVERROR(ENOSYS);
  }
  
@@ -38,6 +38,7 @@ index 628cedc050..6ad0f5cfa0 100644
 +    media_size = get_media_stream_size(v);
 +    if (media_size < 0 || media_offset >= media_size)
 +        return AVERROR_EOF;
++    v->cur_seg_size = media_size;
 +
 +    absolute_offset = v->cur_seg->url_offset + media_offset;
 +    ret = avio_seek(v->input, absolute_offset, SEEK_SET);
@@ -59,7 +60,7 @@ index 628cedc050..6ad0f5cfa0 100644
 +    v->cur_seg->url_offset = original_url_offset;
 +    v->cur_seg->size = original_seg_size;
 +    v->cur_seg_offset = media_offset;
-+    v->cur_seg_size = original_seg_size;
++    v->cur_seg_size = ret < 0 ? original_seg_size : media_size;
 +
 +    av_log(v->parent, AV_LOG_WARNING,
 +           "DASH SegmentBase short EOF, reopen ret=%d media offset %"PRId64"/%"PRId64" absolute %"PRId64", playlist %d\n",

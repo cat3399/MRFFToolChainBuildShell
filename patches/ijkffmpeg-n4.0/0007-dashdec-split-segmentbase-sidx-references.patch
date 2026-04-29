@@ -1,0 +1,250 @@
+From 0360c3f472f3ee82ea1a7ea1cb4bc82cf4b5dcfb Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Wed, 29 Apr 2026 14:31:22 +0800
+Subject: [PATCH] dashdec: split SegmentBase sidx references
+
+---
+ libavformat/dashdec.c | 213 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 213 insertions(+)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index f45a548..548d656 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -321,6 +321,31 @@ static void free_fragment_list(struct representation *pls)
+     pls->n_fragments = 0;
+ }
+ 
++static int clone_fragment(struct fragment **dst, const struct fragment *src)
++{
++    struct fragment *seg;
++
++    if (!dst || !src)
++        return AVERROR(EINVAL);
++
++    seg = av_mallocz(sizeof(*seg));
++    if (!seg)
++        return AVERROR(ENOMEM);
++
++    seg->url_offset = src->url_offset;
++    seg->size = src->size;
++    if (src->url) {
++        seg->url = av_strdup(src->url);
++        if (!seg->url) {
++            av_free(seg);
++            return AVERROR(ENOMEM);
++        }
++    }
++
++    *dst = seg;
++    return 0;
++}
++
+ static void free_timelines_list(struct representation *pls)
+ {
+     int i;
+@@ -612,6 +637,179 @@ static int64_t get_fragment_end_offset(struct fragment *seg)
+     return seg->url_offset + seg->size - 1;
+ }
+ 
++static int parse_segmentbase_sidx(AVFormatContext *s, struct representation *rep,
++                                  struct fragment *media,
++                                  const uint8_t *data, int data_size)
++{
++    const uint8_t *p = data;
++    const uint8_t *end = data + data_size;
++    int parsed = 0;
++
++    if (!rep || !media || !data || data_size < 8)
++        return 0;
++
++    while (p + 8 <= end) {
++        uint64_t box_size = AV_RB32(p);
++        uint32_t box_type = AV_RB32(p + 4);
++        int header_size = 8;
++        const uint8_t *box;
++        const uint8_t *q;
++        uint32_t version;
++        uint32_t timescale;
++        uint16_t reference_count;
++        uint64_t earliest_presentation_time;
++        uint64_t first_offset;
++        uint64_t offset;
++        int64_t media_start;
++        char *media_url;
++        struct fragment **new_fragments = NULL;
++        struct timeline **new_timelines = NULL;
++        int n_new_fragments = 0;
++        int n_new_timelines = 0;
++        int i;
++
++        if (box_size == 1) {
++            if (p + 16 > end)
++                break;
++            box_size = AV_RB64(p + 8);
++            header_size = 16;
++        } else if (box_size == 0) {
++            box_size = end - p;
++        }
++
++        if (box_size < header_size || p + box_size > end)
++            break;
++
++        if (box_type != MKBETAG('s', 'i', 'd', 'x')) {
++            p += box_size;
++            continue;
++        }
++
++        box = p;
++        q = box + header_size;
++        if (q + 12 > box + box_size)
++            return AVERROR_INVALIDDATA;
++
++        version = q[0];
++        q += 4; /* version + flags */
++        q += 4; /* reference_ID */
++        timescale = AV_RB32(q);
++        q += 4;
++        if (!timescale)
++            return AVERROR_INVALIDDATA;
++
++        if (version == 0) {
++            if (q + 8 > box + box_size)
++                return AVERROR_INVALIDDATA;
++            earliest_presentation_time = AV_RB32(q);
++            q += 4;
++            first_offset = AV_RB32(q);
++            q += 4;
++        } else {
++            if (q + 16 > box + box_size)
++                return AVERROR_INVALIDDATA;
++            earliest_presentation_time = AV_RB64(q);
++            q += 8;
++            first_offset = AV_RB64(q);
++            q += 8;
++        }
++
++        if (q + 4 > box + box_size)
++            return AVERROR_INVALIDDATA;
++        q += 2; /* reserved */
++        reference_count = AV_RB16(q);
++        q += 2;
++        if (!reference_count || q + (int64_t)reference_count * 12 > box + box_size)
++            return AVERROR_INVALIDDATA;
++
++        media_start = media->url_offset;
++        media_url = av_strdup(media->url);
++        if (!media_url)
++            return AVERROR(ENOMEM);
++
++        offset = media_start + first_offset;
++
++        for (i = 0; i < reference_count; i++) {
++            uint32_t ref = AV_RB32(q);
++            uint32_t duration = AV_RB32(q + 4);
++            struct fragment *seg = NULL;
++            struct timeline *tml = NULL;
++            int ret;
++
++            q += 12;
++            if (ref & 0x80000000) {
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR_PATCHWELCOME;
++            }
++
++            seg = av_mallocz(sizeof(*seg));
++            tml = av_mallocz(sizeof(*tml));
++            if (!seg || !tml) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR(ENOMEM);
++            }
++            seg->url = av_strdup(media_url);
++            if (!seg->url) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR(ENOMEM);
++            }
++            seg->url_offset = offset;
++            seg->size = ref & 0x7fffffff;
++            if (!i)
++                tml->starttime = earliest_presentation_time;
++            tml->duration = duration;
++            tml->repeat = 0;
++
++            ret = av_dynarray_add_nofree(&new_fragments, &n_new_fragments, seg);
++            if (ret < 0) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return ret;
++            }
++            ret = av_dynarray_add_nofree(&new_timelines, &n_new_timelines, tml);
++            if (ret < 0) {
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return ret;
++            }
++            offset += seg->size;
++            parsed++;
++        }
++
++        free_fragment_list(rep);
++        free_timelines_list(rep);
++        rep->fragments = new_fragments;
++        rep->n_fragments = n_new_fragments;
++        rep->timelines = new_timelines;
++        rep->n_timelines = n_new_timelines;
++        rep->fragment_timescale = timescale;
++        rep->first_seq_no = 0;
++        rep->last_seq_no = rep->n_fragments - 1;
++        av_log(s, AV_LOG_VERBOSE,
++               "DASH SegmentBase parsed sidx refs=%d timescale=%u media [%"PRId64",%"PRId64"], representation %s\n",
++               rep->n_fragments, timescale, media_start, (int64_t)offset - 1, rep->id);
++        av_free(media_url);
++        return parsed;
++    }
++
++    return 0;
++}
++
+ static int parse_manifest_segmentbase(AVFormatContext *s, struct representation *rep,
+                                       xmlNodePtr segmentbase_node,
+                                       xmlNodePtr *baseurl_nodes,
+@@ -1822,6 +2020,21 @@ static int update_init_section(struct representation *pls)
+ 
+     pls->init_sec_data_len = ret;
+     pls->init_sec_buf_read_offset = 0;
++    if (pls->n_fragments == 1 && pls->fragments[0] && pls->fragments[0]->url_offset > 0) {
++        struct fragment *old_cur = pls->cur_seg;
++        ret = parse_segmentbase_sidx(pls->parent, pls, pls->fragments[0],
++                                     pls->init_sec_buf, pls->init_sec_data_len);
++        if (ret < 0)
++            return ret;
++        if (ret > 0) {
++            pls->pb.seekable = pls->n_fragments == 1 ? AVIO_SEEKABLE_NORMAL : 0;
++            free_fragment(&old_cur);
++            pls->cur_seg = NULL;
++            ret = clone_fragment(&pls->cur_seg, pls->fragments[pls->cur_seq_no]);
++            if (ret < 0)
++                return ret;
++        }
++    }
+ 
+     return 0;
+ }
+-- 
+2.50.1 (Apple Git-155)
+

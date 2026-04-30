@@ -1,0 +1,62 @@
+From 8f4e5ef0bbf2db58d4c8b73b2b7a6b8d782f6a70 Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Thu, 30 Apr 2026 23:59:00 +0800
+Subject: [PATCH] dashdec: clean up failed demux reopen
+
+SegmentBase sidx splitting makes DASH seek reopen the child demuxer
+more often.  If probing, opening, or stream-info collection fails during
+that reopen, dashdec used to return immediately and leave resources
+owned by the half-open component behind: the AVIO buffer, any HTTP input
+opened by read_data(), and sometimes the child AVFormatContext.
+
+Keep the normal close path unchanged, but make the failure path unwind
+the partially opened component before returning.
+---
+ libavformat/dashdec.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 0ca76ff..f93b25c 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1911,5 +1911,26 @@ static void close_demux_for_component(struct representation *pls)
+     avformat_close_input(&pls->ctx);
+     pls->ctx = NULL;
+ }
+ 
++static void cleanup_failed_demux_reopen(AVFormatContext *s, struct representation *pls)
++{
++    AVFormatContext *parent = pls->parent ? pls->parent : s;
++
++    if (pls->ctx) {
++        pls->ctx->pb = NULL;
++        if (pls->ctx->iformat) {
++            avformat_close_input(&pls->ctx);
++        } else {
++            avformat_free_context(pls->ctx);
++            pls->ctx = NULL;
++        }
++    }
++
++    av_freep(&pls->pb.buffer);
++    memset(&pls->pb, 0x00, sizeof(AVIOContext));
++
++    if (pls->input)
++        ff_format_io_close(parent, &pls->input);
++}
++
+ static int reopen_demux_for_component(AVFormatContext *s, struct representation *pls)
+@@ -1978,6 +1999,11 @@ fail:
+     }
+ 
+ fail:
++    if (ret < 0) {
++        av_log(s, AV_LOG_VERBOSE,
++               "DASH demux reopen failed ret=%d, cleaning playlist %d\n", ret, (int)pls->rep_idx);
++        cleanup_failed_demux_reopen(s, pls);
++    }
+     return ret;
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)

@@ -1,0 +1,48 @@
+From 4fe898eaebecc69f3993373fa40f78b42b345e67 Mon Sep 17 00:00:00 2001
+From: FFToolChain <fftoolchain@localhost>
+Date: Fri, 1 May 2026 15:56:04 +0800
+Subject: [PATCH] dashdec: require url template before expansion
+
+---
+ libavformat/dashdec.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index b7afeab..fd9754d 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1895,9 +1895,10 @@ static struct fragment *get_current_fragment(struct representation *pls)
+             return NULL;
+         }
+     }
+-    if (seg) {
++    if (seg && pls->url_template) {
+         char *tmpfilename= av_mallocz(c->max_url_size);
+         if (!tmpfilename) {
++            av_free(seg);
+             return NULL;
+         }
+         ff_dash_fill_tmpl_params(tmpfilename, c->max_url_size, pls->url_template, 0, pls->cur_seq_no, 0, get_segment_start_time_based_on_timeline(pls, pls->cur_seq_no));
+@@ -1908,11 +1909,19 @@ static struct fragment *get_current_fragment(struct representation *pls)
+             if (!seg->url) {
+                 av_log(pls->parent, AV_LOG_ERROR, "Cannot resolve template url '%s'\n", pls->url_template);
+                 av_free(tmpfilename);
++                av_free(seg);
+                 return NULL;
+             }
+         }
+         av_free(tmpfilename);
+         seg->size = -1;
++    } else if (seg) {
++        av_log(pls->parent, AV_LOG_WARNING,
++               "DASH representation has no segment URL template, cur[%"PRId64"] last[%"PRId64"] fragments[%d], playlist %d\n",
++               (int64_t)pls->cur_seq_no, (int64_t)pls->last_seq_no,
++               (int)pls->n_fragments, (int)pls->rep_idx);
++        av_free(seg);
++        seg = NULL;
+     }
+ 
+     return seg;
+-- 
+2.50.1 (Apple Git-155)
+

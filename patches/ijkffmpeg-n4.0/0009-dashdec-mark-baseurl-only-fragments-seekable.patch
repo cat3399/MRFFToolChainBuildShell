@@ -1,4 +1,4 @@
-From 9c7d6240233c10d0fb2bc205ccac4f879ceffdb3 Mon Sep 17 00:00:00 2001
+From f8b6da87d4be81337b0022db94897605f5fb4834 Mon Sep 17 00:00:00 2001
 From: FFToolChain <fftoolchain@localhost>
 Date: Sun, 3 May 2026 03:10:00 +0800
 Subject: [PATCH] dashdec: mark BaseURL-only fragments seekable
@@ -8,14 +8,14 @@ resource. Let the nested MOV/MP4 demuxer seek through dashdec's custom IO
 so single-file .m4s URLs from app playurl can be parsed and seeked natively.
 SegmentBase playlists still keep dashdec-owned fragment boundaries.
 ---
- libavformat/dashdec.c | 19 ++++++++++++++++++-
- 1 file changed, 18 insertions(+), 1 deletion(-)
+ libavformat/dashdec.c | 71 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 68 insertions(+), 3 deletions(-)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
-index fd9754d..43ae046 100644
+index c86fac8..9b35319 100644
 --- a/libavformat/dashdec.c
 +++ b/libavformat/dashdec.c
-@@ -1816,10 +1816,22 @@ static int update_init_section(struct representation *pls)
+@@ -1803,11 +1803,73 @@ static int update_init_section(struct representation *pls)
      return 0;
  }
  
@@ -26,20 +26,72 @@ index fd9754d..43ae046 100644
 +           !pls->init_section &&
 +           pls->fragments &&
 +           pls->fragments[0] &&
++           pls->fragments[0]->url_offset == 0 &&
 +           pls->fragments[0]->size < 0;
++}
++
++static int64_t seek_single_full_fragment(struct representation *v, int64_t offset, int whence)
++{
++    int64_t pos;
++    int64_t size;
++
++    if (!v->input)
++        return AVERROR(EIO);
++
++    whence &= ~AVSEEK_FORCE;
++    if (whence == AVSEEK_SIZE)
++        return avio_size(v->input);
++
++    if (whence == SEEK_CUR) {
++        pos = avio_tell(v->input);
++        if (pos < 0)
++            return pos;
++        if ((offset > 0 && pos > INT64_MAX - offset) ||
++            (offset < 0 && pos < INT64_MIN - offset))
++            return AVERROR(EINVAL);
++        offset += pos;
++    } else if (whence == SEEK_END) {
++        size = avio_size(v->input);
++        if (size < 0)
++            return size;
++        if ((offset > 0 && size > INT64_MAX - offset) ||
++            (offset < 0 && size < INT64_MIN - offset))
++            return AVERROR(EINVAL);
++        offset += size;
++    } else if (whence != SEEK_SET) {
++        return AVERROR(EINVAL);
++    }
++
++    if (offset < 0)
++        return AVERROR(EINVAL);
++
++    size = avio_size(v->input);
++    if (size >= 0 && offset > size) {
++        av_log(v->parent, AV_LOG_VERBOSE,
++               "DASH single-file seek out of range, offset %"PRId64" size %"PRId64", playlist %d\n",
++               offset, size, v->rep_idx);
++        return AVERROR(EINVAL);
++    }
++
++    pos = avio_seek(v->input, offset, SEEK_SET);
++    if (pos >= 0)
++        v->cur_seg_offset = pos;
++    return pos;
 +}
 +
  static int64_t seek_data(void *opaque, int64_t offset, int whence)
  {
      struct representation *v = opaque;
 -    if (v->n_fragments && !v->init_sec_data_len) {
+-        return avio_seek(v->input, offset, whence);
 +    if (v->input &&
 +        is_single_full_fragment_representation(v) &&
 +        !v->init_sec_data_len) {
-         return avio_seek(v->input, offset, whence);
++        return seek_single_full_fragment(v, offset, whence);
      }
  
-@@ -1945,7 +1958,10 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+     return AVERROR(ENOSYS);
+@@ -1949,7 +2011,10 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
      } else {
          ffio_init_context(&pls->pb, avio_ctx_buffer , INITIAL_BUFFER_SIZE, 0, pls, read_data, NULL, seek_data);
      }
@@ -53,3 +105,4 @@ index fd9754d..43ae046 100644
          goto fail;
 -- 
 2.50.1 (Apple Git-155)
+

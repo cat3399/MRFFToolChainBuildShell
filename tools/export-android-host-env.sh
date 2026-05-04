@@ -102,9 +102,13 @@ export MR_NDK_REL=$(grep -m 1 -o '^## r[0-9]*.*' $MR_ANDROID_NDK_HOME/CHANGELOG.
 
 export MR_TOOLCHAIN_ROOT="$MR_ANDROID_NDK_HOME/toolchains/llvm/prebuilt/${MR_HOST_TAG}"
 export PATH="${MR_TOOLCHAIN_ROOT}/bin:$PATH"
-export MR_SYS_ROOT="${MR_TOOLCHAIN_ROOT}/sysroot"
+if [[ -d "${MR_TOOLCHAIN_ROOT}/sysroot" ]]; then
+    export MR_SYS_ROOT="${MR_TOOLCHAIN_ROOT}/sysroot"
+else
+    export MR_SYS_ROOT="${MR_ANDROID_NDK_HOME}/sysroot"
+fi
 
 # Using Make from the Android SDK
 export MR_MAKE_EXECUTABLE=${MR_ANDROID_NDK_HOME}/prebuilt/${MR_HOST_TAG}/bin/make
-# Init Android plat env
-export MR_DEFAULT_ARCHS="armv7a arm64 x86 x86_64"
+# Android 4.0/API 14 only has 32-bit ABIs. 64-bit Android starts at API 21.
+export MR_DEFAULT_ARCHS="${MR_DEFAULT_ARCHS:-armv7a x86}"

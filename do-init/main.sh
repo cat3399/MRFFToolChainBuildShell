@@ -22,10 +22,25 @@ set -e
 THIS_DIR=$(DIRNAME=$(dirname "$0"); cd "$DIRNAME"; pwd)
 cd "$THIS_DIR"
 
+function reset_lib_config_env() {
+    unset LIB_NAME
+    unset LIPO_LIBS
+    unset LIB_DEPENDS_BIN
+    unset CMAKE_TARGETS_NAME
+    unset GIT_LOCAL_REPO
+    unset REPO_DIR
+    unset GIT_COMMIT
+    unset GIT_REPO_VERSION
+    unset GIT_UPSTREAM
+    unset GIT_WITH_SUBMODULE
+    unset PATCH_DIR
+}
+
 for lib in $MR_VENDOR_LIBS
 do
     echo "===[init $lib]==========="
     [[ ! -f "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh" ]] && (echo "❌$lib config not exist,init will stop.";exit 1;)
+    reset_lib_config_env
     source "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh"
     ./init-repo.sh
     echo "========================="

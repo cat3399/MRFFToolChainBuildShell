@@ -47,6 +47,9 @@ cmake -S ${MR_BUILD_SOURCE}                         \
     -DCMAKE_RANLIB=${MR_RANLIB}                     \
     -DCMAKE_AR=${MR_AR}                             \
     -DCMAKE_STRIP=${MR_STRIP}                       \
+    -DCMAKE_C_COMPILER_AR=${MR_AR}                  \
+    -DCMAKE_CXX_COMPILER_AR=${MR_AR}                \
+    -DCMAKE_C_COMPILER_RANLIB=${MR_RANLIB}          \
     -DCMAKE_CXX_COMPILER_RANLIB=${MR_RANLIB}        \
     -DANDROID_PLATFORM=android-${MR_ANDROID_API}    \
     -DANDROID_STL=c++_shared                        \

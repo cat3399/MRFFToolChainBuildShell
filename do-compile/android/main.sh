@@ -23,12 +23,27 @@ set -e
 THIS_DIR=$(DIRNAME=$(dirname "$0"); cd "$DIRNAME"; pwd)
 cd "$THIS_DIR"
 
+function reset_lib_config_env() {
+    unset LIB_NAME
+    unset LIPO_LIBS
+    unset LIB_DEPENDS_BIN
+    unset CMAKE_TARGETS_NAME
+    unset GIT_LOCAL_REPO
+    unset REPO_DIR
+    unset GIT_COMMIT
+    unset GIT_REPO_VERSION
+    unset GIT_UPSTREAM
+    unset GIT_WITH_SUBMODULE
+    unset PATCH_DIR
+}
+
 # 循环编译所有的库
 for lib in $MR_VENDOR_LIBS
 do
     [[ ! -f "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh" ]] && (echo "❌$lib config not exist,compile will stop.";exit 1;)
 
     echo "===[$MR_CMD $lib]===================="
+    reset_lib_config_env
     source "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh"
     
     echo "LIB_NAME        : [$LIB_NAME]"

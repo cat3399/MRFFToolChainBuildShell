@@ -42,7 +42,7 @@ Clone vendor library git repository,Checkout specify commit,Apply patches
 OPTIONS:
     -p                   Specify platform (ios,macos,tvos,android), can't be nil
     -a                   Specify archs (x86_64,arm64,x86_64_simulator,arm64_simulator,all) all="x86_64,arm64,x86_64_simulator,arm64_simulator"
-    -l                   Specify which libs need init (libyuv|openssl|openssl3|opus|bluray|dav1d|dvdread|freetype|fribidi|harfbuzz|unibreak|ass|ijkffmpeg|fftutorial|ffmpeg4|ffmpeg5|ffmpeg6|ffmpeg7), can't be nil
+    -l                   Specify which libs need init (libyuv|openssl|openssl3|opus|bluray|dav1d|dvdread|freetype|fribidi|harfbuzz|unibreak|ass|ijkffmpeg|ijkffmpeg7|fftutorial|ffmpeg4|ffmpeg5|ffmpeg6|ffmpeg7), can't be nil
     -s                   Specify workspace dir
     --help               Show help banner of init command
     --skip-pull-base     Skip pull base repo

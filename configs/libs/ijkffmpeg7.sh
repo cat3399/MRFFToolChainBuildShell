@@ -11,7 +11,10 @@ export LIPO_LIBS="libavcodec libavformat libavutil libswscale libswresample liba
 export LIB_DEPENDS_BIN="nasm pkg-config"
 export GIT_LOCAL_REPO=extra/ffmpeg
 export REPO_DIR=ijkffmpeg7
-export PATCH_DIR=ffmpeg-n7.1.1
+# Start from a clean upstream baseline. The generic ffmpeg-n7.1.1 patch set
+# contains ffmpeg-kit/debugly changes that are not part of the classic IJK
+# port and currently mixes AVInputFormat with FFInputFormat.
+export PATCH_DIR=
 
 if [[ "$GIT_FFMPEG_UPSTREAM" != "" ]] ;then
     export GIT_UPSTREAM="$GIT_FFMPEG_UPSTREAM"
@@ -21,4 +24,3 @@ fi
 
 export GIT_COMMIT=n7.1.1
 export GIT_REPO_VERSION=7.1.1
-

@@ -50,12 +50,18 @@ case $_MR_ARCH in
     ;;
 esac
 
-CFG_FLAGS="no-shared no-engine no-apps no-dynamic-engine no-static-engine \
+CFG_FLAGS="no-shared no-engine no-dynamic-engine no-static-engine \
         no-dso no-ui-console no-tests \
         --prefix=$MR_BUILD_PREFIX \
         --openssldir=$MR_BUILD_PREFIX \
         -U__ANDROID_API__ -D__ANDROID_API__=$MR_ANDROID_API \
         $os"
+
+# no-apps is available in OpenSSL 3.x but rejected by the 1.1.1 Configure
+# script used by the classic IJK baseline.
+if [[ "$GIT_REPO_VERSION" == 3.* ]]; then
+    CFG_FLAGS="$CFG_FLAGS no-apps"
+fi
 
 if [[ "$MR_DEBUG" != "debug" ]]; then
     CFG_FLAGS="$CFG_FLAGS --release"

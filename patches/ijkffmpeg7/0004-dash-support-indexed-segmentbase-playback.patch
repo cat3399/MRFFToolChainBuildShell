@@ -1,0 +1,501 @@
+From 79de54efe65c99f455a7a04d546c007df05c67c8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Fri, 17 Jul 2026 00:45:05 +0800
+Subject: [PATCH] avformat/dash: support indexed SegmentBase playback
+
+---
+ libavformat/dashdec.c | 386 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 380 insertions(+), 6 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index c6ab9fe..1d4f33a 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -22,6 +22,7 @@
+ #include <libxml/parser.h>
+ #include <time.h>
+ #include "libavutil/bprint.h"
++#include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
+@@ -118,6 +119,7 @@ struct representation {
+     uint32_t init_sec_buf_read_offset;
+     int64_t cur_timestamp;
+     int is_restart_needed;
++    int is_segmentbase_sidx;
+ };
+ 
+ typedef struct DASHContext {
+@@ -341,6 +343,38 @@ static void free_fragment_list(struct representation *pls)
+     pls->n_fragments = 0;
+ }
+ 
++static int clone_fragment(struct fragment **dst, const struct fragment *src)
++{
++    struct fragment *seg;
++
++    if (!dst || !src)
++        return AVERROR(EINVAL);
++
++    seg = av_mallocz(sizeof(*seg));
++    if (!seg)
++        return AVERROR(ENOMEM);
++
++    seg->url_offset = src->url_offset;
++    seg->size = src->size;
++    if (src->url) {
++        seg->url = av_strdup(src->url);
++        if (!seg->url) {
++            av_free(seg);
++            return AVERROR(ENOMEM);
++        }
++    }
++
++    *dst = seg;
++    return 0;
++}
++
++static int64_t get_fragment_end_offset(struct fragment *seg)
++{
++    if (!seg || seg->size < 0)
++        return -1;
++    return seg->url_offset + seg->size - 1;
++}
++
+ static void free_timelines_list(struct representation *pls)
+ {
+     int i;
+@@ -600,6 +634,286 @@ static struct fragment * get_Fragment(char *range)
+     return seg;
+ }
+ 
++static int parse_manifest_segmentbase(AVFormatContext *s, struct representation *rep,
++                                      xmlNodePtr segmentbase_node,
++                                      xmlNodePtr *baseurl_nodes,
++                                      char *rep_id_val,
++                                      char *rep_bandwidth_val)
++{
++    DASHContext *c = s->priv_data;
++    xmlNodePtr initialization_node;
++    struct fragment *init_section = NULL;
++    struct fragment *index_section = NULL;
++    struct fragment *media = NULL;
++    char *index_range = NULL;
++    char *initialization_source = NULL;
++    char *initialization_range = NULL;
++    int64_t bootstrap_start = INT64_MAX;
++    int64_t bootstrap_end = -1;
++    int64_t current_end;
++    int max_url_size = c ? c->max_url_size : MAX_URL_SIZE;
++    int ret = 0;
++
++    initialization_node = find_child_node_by_name(segmentbase_node, "Initialization");
++    if (initialization_node) {
++        initialization_source = xmlGetProp(initialization_node, "sourceURL");
++        initialization_range = xmlGetProp(initialization_node, "range");
++        if (initialization_source || initialization_range) {
++            init_section = get_Fragment(initialization_range);
++            if (!init_section) {
++                ret = AVERROR_INVALIDDATA;
++                goto cleanup;
++            }
++            init_section->url = get_content_url(baseurl_nodes, 4, max_url_size,
++                                                rep_id_val, rep_bandwidth_val,
++                                                initialization_source);
++            if (!init_section->url) {
++                ret = AVERROR(ENOMEM);
++                goto cleanup;
++            }
++            current_end = get_fragment_end_offset(init_section);
++            if (current_end >= 0) {
++                bootstrap_start = FFMIN(bootstrap_start, init_section->url_offset);
++                bootstrap_end = FFMAX(bootstrap_end, current_end);
++            }
++        }
++    }
++
++    index_range = xmlGetProp(segmentbase_node, "indexRange");
++    if (index_range) {
++        index_section = get_Fragment(index_range);
++        if (!index_section) {
++            ret = AVERROR_INVALIDDATA;
++            goto cleanup;
++        }
++        current_end = get_fragment_end_offset(index_section);
++        if (current_end >= 0) {
++            bootstrap_start = FFMIN(bootstrap_start, index_section->url_offset);
++            bootstrap_end = FFMAX(bootstrap_end, current_end);
++        }
++    }
++
++    media = av_mallocz(sizeof(*media));
++    if (!media) {
++        ret = AVERROR(ENOMEM);
++        goto cleanup;
++    }
++    media->url = get_content_url(baseurl_nodes, 4, max_url_size,
++                                 rep_id_val, rep_bandwidth_val, NULL);
++    if (!media->url) {
++        ret = AVERROR(ENOMEM);
++        goto cleanup;
++    }
++    media->size = -1;
++    if (bootstrap_end >= 0)
++        media->url_offset = bootstrap_end + 1;
++
++    if (init_section && bootstrap_end >= 0 && !strcmp(init_section->url, media->url)) {
++        init_section->url_offset = bootstrap_start;
++        init_section->size = bootstrap_end - bootstrap_start + 1;
++    } else if (bootstrap_end >= 0 && !init_section) {
++        av_log(s, AV_LOG_WARNING,
++               "DASH SegmentBase is missing Initialization for representation %s\n",
++               rep_id_val ? rep_id_val : "");
++    }
++
++    rep->init_section = init_section;
++    init_section = NULL;
++    ret = av_dynarray_add_nofree(&rep->fragments, &rep->n_fragments, media);
++    if (ret < 0)
++        goto cleanup;
++    media = NULL;
++
++cleanup:
++    free_fragment(&init_section);
++    free_fragment(&index_section);
++    free_fragment(&media);
++    xmlFree(initialization_source);
++    xmlFree(initialization_range);
++    xmlFree(index_range);
++    return ret;
++}
++
++static int parse_segmentbase_sidx(AVFormatContext *s, struct representation *rep,
++                                  struct fragment *media,
++                                  const uint8_t *data, int data_size,
++                                  int *sidx_offset)
++{
++    const uint8_t *p = data;
++    const uint8_t *end = data + data_size;
++    int parsed = 0;
++
++    if (sidx_offset)
++        *sidx_offset = -1;
++
++    if (!rep || !media || !data || data_size < 8)
++        return 0;
++
++    while (p + 8 <= end) {
++        uint64_t box_size = AV_RB32(p);
++        uint32_t box_type = AV_RB32(p + 4);
++        int header_size = 8;
++        const uint8_t *box;
++        const uint8_t *q;
++        uint32_t version;
++        uint32_t timescale;
++        uint16_t reference_count;
++        uint64_t earliest_presentation_time;
++        uint64_t first_offset;
++        uint64_t offset;
++        int64_t media_start;
++        char *media_url;
++        struct fragment **new_fragments = NULL;
++        struct timeline **new_timelines = NULL;
++        int n_new_fragments = 0;
++        int n_new_timelines = 0;
++        int i;
++
++        if (box_size == 1) {
++            if (p + 16 > end)
++                break;
++            box_size = AV_RB64(p + 8);
++            header_size = 16;
++        } else if (box_size == 0) {
++            box_size = end - p;
++        }
++
++        if (box_size < header_size || p + box_size > end)
++            break;
++
++        if (box_type != MKBETAG('s', 'i', 'd', 'x')) {
++            p += box_size;
++            continue;
++        }
++        if (sidx_offset)
++            *sidx_offset = p - data;
++
++        box = p;
++        q = box + header_size;
++        if (q + 12 > box + box_size)
++            return AVERROR_INVALIDDATA;
++
++        version = q[0];
++        q += 4; /* version + flags */
++        q += 4; /* reference_ID */
++        timescale = AV_RB32(q);
++        q += 4;
++        if (!timescale)
++            return AVERROR_INVALIDDATA;
++
++        if (version == 0) {
++            if (q + 8 > box + box_size)
++                return AVERROR_INVALIDDATA;
++            earliest_presentation_time = AV_RB32(q);
++            q += 4;
++            first_offset = AV_RB32(q);
++            q += 4;
++        } else {
++            if (q + 16 > box + box_size)
++                return AVERROR_INVALIDDATA;
++            earliest_presentation_time = AV_RB64(q);
++            q += 8;
++            first_offset = AV_RB64(q);
++            q += 8;
++        }
++
++        if (q + 4 > box + box_size)
++            return AVERROR_INVALIDDATA;
++        q += 2; /* reserved */
++        reference_count = AV_RB16(q);
++        q += 2;
++        if (!reference_count || q + (int64_t)reference_count * 12 > box + box_size)
++            return AVERROR_INVALIDDATA;
++
++        media_start = media->url_offset;
++        media_url = av_strdup(media->url);
++        if (!media_url)
++            return AVERROR(ENOMEM);
++
++        offset = media_start + first_offset;
++
++        for (i = 0; i < reference_count; i++) {
++            uint32_t ref = AV_RB32(q);
++            uint32_t duration = AV_RB32(q + 4);
++            struct fragment *seg = NULL;
++            struct timeline *tml = NULL;
++            int ret;
++
++            q += 12;
++            if (ref & 0x80000000) {
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR_PATCHWELCOME;
++            }
++
++            seg = av_mallocz(sizeof(*seg));
++            tml = av_mallocz(sizeof(*tml));
++            if (!seg || !tml) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR(ENOMEM);
++            }
++            seg->url = av_strdup(media_url);
++            if (!seg->url) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return AVERROR(ENOMEM);
++            }
++            seg->url_offset = offset;
++            seg->size = ref & 0x7fffffff;
++            if (!i)
++                tml->starttime = earliest_presentation_time;
++            tml->duration = duration;
++            tml->repeat = 0;
++
++            ret = av_dynarray_add_nofree(&new_fragments, &n_new_fragments, seg);
++            if (ret < 0) {
++                free_fragment(&seg);
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return ret;
++            }
++            ret = av_dynarray_add_nofree(&new_timelines, &n_new_timelines, tml);
++            if (ret < 0) {
++                av_freep(&tml);
++                av_free(media_url);
++                free_fragment_list(&(struct representation){ .fragments = new_fragments, .n_fragments = n_new_fragments });
++                free_timelines_list(&(struct representation){ .timelines = new_timelines, .n_timelines = n_new_timelines });
++                return ret;
++            }
++            offset += seg->size;
++            parsed++;
++        }
++
++        free_fragment_list(rep);
++        free_timelines_list(rep);
++        rep->fragments = new_fragments;
++        rep->n_fragments = n_new_fragments;
++        rep->timelines = new_timelines;
++        rep->n_timelines = n_new_timelines;
++        rep->fragment_timescale = timescale;
++        rep->first_seq_no = 0;
++        rep->last_seq_no = rep->n_fragments - 1;
++        rep->is_segmentbase_sidx = 1;
++        av_log(s, AV_LOG_VERBOSE,
++               "DASH SegmentBase parsed sidx refs=%d timescale=%u media [%"PRId64",%"PRId64"], representation %s\n",
++               rep->n_fragments, timescale, media_start, (int64_t)offset - 1, rep->id);
++        av_free(media_url);
++        return parsed;
++    }
++
++    return 0;
++}
++
+ static int parse_manifest_segmenturlnode(AVFormatContext *s, struct representation *rep,
+                                          xmlNodePtr fragmenturl_node,
+                                          xmlNodePtr *baseurl_nodes,
+@@ -850,6 +1164,8 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
+     xmlNodePtr representation_segmenttemplate_node = NULL;
+     xmlNodePtr representation_baseurl_node = NULL;
+     xmlNodePtr representation_segmentlist_node = NULL;
++    xmlNodePtr representation_segmentbase_node = NULL;
++    xmlNodePtr adaptionset_segmentbase_node = NULL;
+     xmlNodePtr segmentlists_tab[3];
+     xmlNodePtr fragment_timeline_node = NULL;
+     xmlNodePtr fragment_templates_tab[5];
+@@ -890,6 +1206,8 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
+     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
+     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
+     representation_segmentlist_node = find_child_node_by_name(representation_node, "SegmentList");
++    representation_segmentbase_node = find_child_node_by_name(representation_node, "SegmentBase");
++    adaptionset_segmentbase_node = find_child_node_by_name(adaptionset_node, "SegmentBase");
+     rep_bandwidth_val = xmlGetProp(representation_node, "bandwidth");
+     val               = xmlGetProp(representation_node, "id");
+     if (val) {
+@@ -1000,6 +1318,14 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
+                 fragment_timeline_node = xmlNextElementSibling(fragment_timeline_node);
+             }
+         }
++    } else if ((representation_segmentbase_node || adaptionset_segmentbase_node) &&
++               representation_baseurl_node && !representation_segmentlist_node) {
++        ret = parse_manifest_segmentbase(s, rep,
++                                         representation_segmentbase_node ? representation_segmentbase_node
++                                                                         : adaptionset_segmentbase_node,
++                                         baseurl_nodes, rep->id, rep_bandwidth_val);
++        if (ret < 0)
++            goto free;
+     } else if (representation_baseurl_node && !representation_segmentlist_node) {
+         seg = av_mallocz(sizeof(struct fragment));
+         if (!seg)
+@@ -1679,17 +2005,24 @@ static int read_from_url(struct representation *pls, struct fragment *seg,
+     int ret;
+ 
+     /* limit read if the fragment was only a part of a file */
+-    if (seg->size >= 0)
+-        buf_size = FFMIN(buf_size, pls->cur_seg_size - pls->cur_seg_offset);
++    if (seg->size >= 0) {
++        int64_t remaining = pls->cur_seg_size - pls->cur_seg_offset;
++        if (remaining <= 0)
++            return AVERROR_EOF;
++        buf_size = FFMIN(buf_size, remaining);
++    }
+ 
+     ret = avio_read(pls->input, buf, buf_size);
+     if (ret > 0)
+         pls->cur_seg_offset += ret;
++    else if (ret == 0)
++        ret = AVERROR_EOF;
+ 
+     return ret;
+ }
+ 
+-static int open_input(DASHContext *c, struct representation *pls, struct fragment *seg)
++static int open_input(DASHContext *c, struct representation *pls,
++                      struct fragment *seg, int bounded)
+ {
+     AVDictionary *opts = NULL;
+     char *url = NULL;
+@@ -1705,7 +2038,8 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
+         /* try to restrict the HTTP request to the part we want
+          * (if this is in fact a HTTP request) */
+         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
+-        av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
++        if (bounded)
++            av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+     }
+ 
+     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+@@ -1732,7 +2066,7 @@ static int update_init_section(struct representation *pls)
+     if (!pls->init_section || pls->init_sec_buf)
+         return 0;
+ 
+-    ret = open_input(c, pls, pls->init_section);
++    ret = open_input(c, pls, pls->init_section, 1);
+     if (ret < 0) {
+         av_log(pls->parent, AV_LOG_WARNING,
+                "Failed to open an initialization section\n");
+@@ -1763,6 +2097,29 @@ static int update_init_section(struct representation *pls)
+ 
+     pls->init_sec_data_len = ret;
+     pls->init_sec_buf_read_offset = 0;
++    if (pls->n_fragments == 1 && pls->fragments[0] && pls->fragments[0]->url_offset > 0) {
++        struct fragment *old_cur = pls->cur_seg;
++        int sidx_offset = -1;
++        ret = parse_segmentbase_sidx(pls->parent, pls, pls->fragments[0],
++                                     pls->init_sec_buf, pls->init_sec_data_len,
++                                     &sidx_offset);
++        if (ret < 0)
++            return ret;
++        if (ret > 0) {
++            if (sidx_offset > 0 && sidx_offset < pls->init_sec_data_len) {
++                pls->init_sec_data_len = sidx_offset;
++                pls->init_sec_buf_read_offset = 0;
++                av_log(pls->parent, AV_LOG_VERBOSE,
++                       "DASH SegmentBase trimmed sidx from init section len=%d, representation %s\n",
++                       sidx_offset, pls->id ? pls->id : "");
++            }
++            free_fragment(&old_cur);
++            pls->cur_seg = NULL;
++            ret = clone_fragment(&pls->cur_seg, pls->fragments[pls->cur_seq_no]);
++            if (ret < 0)
++                return ret;
++        }
++    }
+ 
+     return 0;
+ }
+@@ -1797,7 +2154,7 @@ restart:
+         if (ret)
+             goto end;
+ 
+-        ret = open_input(c, v, v->cur_seg);
++        ret = open_input(c, v, v->cur_seg, !v->is_segmentbase_sidx);
+         if (ret < 0) {
+             if (ff_check_interrupt(c->interrupt_callback)) {
+                 ret = AVERROR_EXIT;
+@@ -1830,6 +2187,23 @@ restart:
+     if (ret > 0)
+         goto end;
+ 
++    /* SegmentBase sidx references are contiguous byte ranges in one media
++     * resource. Keep the HTTP input open and expose the next fragment to the
++     * child demuxer without another TCP/TLS handshake. */
++    if (ret == AVERROR_EOF && v->is_segmentbase_sidx &&
++        v->cur_seq_no < v->last_seq_no) {
++        v->cur_seq_no++;
++        free_fragment(&v->cur_seg);
++        v->cur_seg = get_current_fragment(v);
++        if (!v->cur_seg) {
++            ret = AVERROR_EOF;
++            goto end;
++        }
++        v->cur_seg_offset = 0;
++        v->cur_seg_size = v->cur_seg->size;
++        goto restart;
++    }
++
+     if (c->is_live || v->cur_seq_no < v->last_seq_no) {
+         if (!v->is_restart_needed)
+             v->cur_seq_no++;
+-- 
+2.47.3
+

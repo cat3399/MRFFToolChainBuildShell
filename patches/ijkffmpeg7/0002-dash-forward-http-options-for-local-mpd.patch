@@ -1,11 +1,11 @@
 From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
 Date: Thu, 16 Jul 2026 22:41:00 +0800
-Subject: [PATCH 2/2] dashdec: forward HTTP options for local MPD
+Subject: [PATCH 2/3] dashdec: forward HTTP options for local MPD
 
 ---
- libavformat/dashdec.c | 27 +++++++++++++++++++++++++++
- 1 file changed, 27 insertions(+)
+ libavformat/dashdec.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
 index 71d7906..4a0a6d5 100644
@@ -22,7 +22,7 @@ index 71d7906..4a0a6d5 100644
      int max_url_size;
      char *cenc_decryption_key;
  
-@@ -2026,6 +2030,14 @@ static int dash_read_header(AVFormatContext *s)
+@@ -2026,6 +2030,15 @@ static int dash_read_header(AVFormatContext *s)
      if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
          return ret;
  
@@ -33,11 +33,12 @@ index 71d7906..4a0a6d5 100644
 +    av_dict_set(&c->avio_opts, "referer", c->referer, 0);
 +    av_dict_set(&c->avio_opts, "cookies", c->cookies, 0);
 +    av_dict_set(&c->avio_opts, "headers", c->headers, 0);
++    av_dict_set(&c->avio_opts, "multiple_requests", "1", AV_DICT_DONT_OVERWRITE);
 +
      if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
          return ret;
  
-@@ -2224,6 +2236,10 @@ static int dash_close(AVFormatContext *s)
+@@ -2224,6 +2237,10 @@ static int dash_close(AVFormatContext *s)
      free_subtitle_list(c);
      av_dict_free(&c->avio_opts);
      av_freep(&c->base_url);
@@ -48,7 +49,7 @@ index 71d7906..4a0a6d5 100644
      return 0;
  }
  
-@@ -2346,6 +2362,11 @@ static const AVOption dash_options[] = {
+@@ -2346,6 +2363,11 @@ static const AVOption dash_options[] = {
          {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
          INT_MIN, INT_MAX, FLAGS},
      { "cenc_decryption_key", "Media decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },

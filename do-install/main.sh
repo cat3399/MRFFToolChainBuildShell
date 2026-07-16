@@ -55,6 +55,7 @@ function install_libs()
         [[ ! -f "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh" ]] && (echo "❌$lib config not exist,install will stop.";exit 1;)
         
         echo "===[install $lib]===================="
+        source "$MR_SHELL_TOOLS_DIR/reset-lib-config.sh"
         source "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh"
         parse_lib_config
         if [[ $FORCE_XCFRAMEWORK ]];then

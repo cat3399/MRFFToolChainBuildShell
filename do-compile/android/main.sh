@@ -29,6 +29,7 @@ do
     [[ ! -f "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh" ]] && (echo "❌$lib config not exist,compile will stop.";exit 1;)
 
     echo "===[$MR_CMD $lib]===================="
+    source "$MR_SHELL_TOOLS_DIR/reset-lib-config.sh"
     source "$MR_SHELL_CONFIGS_DIR/libs/${lib}.sh"
     
     echo "LIB_NAME        : [$LIB_NAME]"

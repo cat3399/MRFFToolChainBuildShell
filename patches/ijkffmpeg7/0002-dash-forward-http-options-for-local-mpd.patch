@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 16 Jul 2026 22:41:00 +0800
+Subject: [PATCH 2/2] dashdec: forward HTTP options for local MPD
+
+---
+ libavformat/dashdec.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 71d7906..4a0a6d5 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -152,6 +152,10 @@ typedef struct DASHContext {
+     AVIOInterruptCB *interrupt_callback;
+     char *allowed_extensions;
+     AVDictionary *avio_opts;
++    char *user_agent;
++    char *referer;
++    char *cookies;
++    char *headers;
+     int max_url_size;
+     char *cenc_decryption_key;
+ 
+@@ -2026,6 +2030,14 @@ static int dash_read_header(AVFormatContext *s)
+     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
+         return ret;
+ 
++    /* A local MPD has a file AVIOContext, so there are no HTTP options to
++     * inherit for representation requests. Explicit demuxer options must win
++     * and be forwarded to every DASH sub-request. */
++    av_dict_set(&c->avio_opts, "user_agent", c->user_agent, 0);
++    av_dict_set(&c->avio_opts, "referer", c->referer, 0);
++    av_dict_set(&c->avio_opts, "cookies", c->cookies, 0);
++    av_dict_set(&c->avio_opts, "headers", c->headers, 0);
++
+     if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
+         return ret;
+ 
+@@ -2224,6 +2236,10 @@ static int dash_close(AVFormatContext *s)
+     free_subtitle_list(c);
+     av_dict_free(&c->avio_opts);
+     av_freep(&c->base_url);
++    av_freep(&c->user_agent);
++    av_freep(&c->referer);
++    av_freep(&c->cookies);
++    av_freep(&c->headers);
+     return 0;
+ }
+ 
+@@ -2346,6 +2362,11 @@ static const AVOption dash_options[] = {
+         {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
+         INT_MIN, INT_MAX, FLAGS},
+     { "cenc_decryption_key", "Media decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
++    { "user_agent", "User-Agent for DASH sub-requests", OFFSET(user_agent), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "user-agent", "Alias for user_agent", OFFSET(user_agent), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "referer", "Referer for DASH sub-requests", OFFSET(referer), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "cookies", "Cookies for DASH sub-requests", OFFSET(cookies), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "headers", "HTTP headers for DASH sub-requests", OFFSET(headers), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     {NULL}
+ };
+ 
+-- 
+2.47.2

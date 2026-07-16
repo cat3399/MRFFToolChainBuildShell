@@ -37,6 +37,10 @@ export COMMON_FF_CFG_FLAGS=
 source $MR_SHELL_CONFIGS_DIR/ijk-ffmpeg-config/module-lite.sh
 FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS $COMMON_FF_CFG_FLAGS"
 
+if [[ "$GIT_REPO_VERSION" == 7.* ]]; then
+    FFMPEG_CFG_FLAGS="${FFMPEG_CFG_FLAGS/--disable-avresample/}"
+fi
+
 # Advanced options (experts only):
 FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-cross-compile"
 # --disable-symver may indicate a bug

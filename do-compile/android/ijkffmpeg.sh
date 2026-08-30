@@ -71,17 +71,15 @@ case "$MR_DEBUG" in
     ;;
 esac
 
-# if [[ "$MR_ARCH" == "armv7a" || "$MR_ARCH" == "arm64" ]]; then
-#     # enable asm
-#     FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-neon"
-#     FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-asm --enable-inline-asm"
-# else
+if [[ "$MR_ARCH" == "armv7a" || "$MR_ARCH" == "arm64" ]]; then
+    FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-neon"
+    FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --enable-asm --enable-inline-asm"
+else
     FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --disable-neon"
     FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --disable-asm --disable-inline-asm"
-
     FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --disable-mmx"
-    FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --assert-level=2"
-# fi
+fi
+FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --assert-level=2"
 
 FFMPEG_CFG_FLAGS="$FFMPEG_CFG_FLAGS --prefix=$MR_BUILD_PREFIX"
 
@@ -124,29 +122,27 @@ if [ ! -d $MR_BUILD_SOURCE ]; then
 fi
 
 cd $MR_BUILD_SOURCE
-if [ -f "./config.h" ]; then
-    echo 'reuse configure'
-else
-    echo
-    echo "CC: $MR_TRIPLE_CC"
-    echo "CFLAGS: $FFMPEG_CFLAGS"
-    echo "LDFLAG:$FFMPEG_LDFLAGS"
-    echo "FF_CFG_FLAGS: $FFMPEG_CFG_FLAGS"
-    echo
+echo
+echo "CC: $MR_TRIPLE_CC"
+echo "CFLAGS: $FFMPEG_CFLAGS"
+echo "LDFLAG:$FFMPEG_LDFLAGS"
+echo "FF_CFG_FLAGS: $FFMPEG_CFG_FLAGS"
+echo
 
-    ./configure \
-        $FFMPEG_CFG_FLAGS \
-        --cc=${MR_TRIPLE_CC} \
-        --as=${MR_TRIPLE_CC} \
-        --ld=${MR_TRIPLE_CC} \
-        --ar=${MR_AR} \
-        --nm=${MR_NM} \
-        --strip=${MR_STRIP} \
-        --ranlib=${MR_RANLIB} \
-        --extra-cflags="$FFMPEG_CFLAGS" \
-        --extra-cxxflags="$FFMPEG_CFLAGS" \
-        --extra-ldflags="$FFMPEG_LDFLAGS"
-fi
+# Reconfigure on every invocation.  Reusing config.h makes build-script flag
+# changes invisible and can silently ship a library with stale CPU features.
+./configure \
+    $FFMPEG_CFG_FLAGS \
+    --cc=${MR_TRIPLE_CC} \
+    --as=${MR_TRIPLE_CC} \
+    --ld=${MR_TRIPLE_CC} \
+    --ar=${MR_AR} \
+    --nm=${MR_NM} \
+    --strip=${MR_STRIP} \
+    --ranlib=${MR_RANLIB} \
+    --extra-cflags="$FFMPEG_CFLAGS" \
+    --extra-cxxflags="$FFMPEG_CFLAGS" \
+    --extra-ldflags="$FFMPEG_LDFLAGS"
 
 #--------------------
 echo "--------------------"

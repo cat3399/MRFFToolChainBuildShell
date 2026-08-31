@@ -1,0 +1,196 @@
+From 3ee79a7388e7e1e7ecea735c02549a108896cbae Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Mon, 31 Aug 2026 20:02:06 +0800
+Subject: [PATCH] avformat/dash: open at initial playback position
+
+---
+ libavformat/dashdec.c | 124 +++++++++++++++++++++++++++++++-----------
+ 1 file changed, 91 insertions(+), 33 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index e2add325cd..587088a944 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -124,6 +124,8 @@ struct representation {
+     int is_restart_needed;
+     int is_segmentbase_sidx;
+     int segmentbase_index_parsed;
++    int initial_position_applied;
++    int initial_position_pending;
+ };
+ 
+ typedef struct DASHContext {
+@@ -164,6 +166,7 @@ typedef struct DASHContext {
+     char *headers;
+     int max_url_size;
+     char *cenc_decryption_key;
++    int64_t initial_position;
+ 
+     /* Flags for init section*/
+     int is_init_section_common_video;
+@@ -1762,6 +1765,72 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
+     return num;
+ }
+ 
++static int64_t calc_seg_no_for_position(struct representation *pls,
++                                        int64_t position_msec)
++{
++    int64_t num = pls->first_seq_no;
++    int64_t duration = 0;
++    int i, j;
++
++    if (position_msec <= 0)
++        return num;
++
++    if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
++        for (i = 0; i < pls->n_timelines; i++) {
++            int segment_count = pls->timelines[i]->repeat >= 0
++                                    ? pls->timelines[i]->repeat + 1
++                                    : 1;
++
++            if (pls->timelines[i]->starttime > 0)
++                duration = pls->timelines[i]->starttime;
++
++            for (j = 0; j < segment_count; j++) {
++                if (duration > INT64_MAX - pls->timelines[i]->duration)
++                    return pls->last_seq_no;
++                duration += pls->timelines[i]->duration;
++                if (position_msec <
++                    av_rescale(duration, 1000, pls->fragment_timescale))
++                    goto found;
++                num++;
++            }
++        }
++        num = pls->last_seq_no;
++    } else if (pls->fragment_duration > 0 &&
++               pls->fragment_timescale > 0) {
++        int64_t position = av_rescale(position_msec,
++                                      pls->fragment_timescale, 1000);
++        num += position / pls->fragment_duration;
++    }
++
++found:
++    if (num < pls->first_seq_no)
++        num = pls->first_seq_no;
++    if (pls->last_seq_no >= pls->first_seq_no && num > pls->last_seq_no)
++        num = pls->last_seq_no;
++    return num;
++}
++
++static void apply_initial_position(struct representation *pls)
++{
++    DASHContext *c = pls->parent->priv_data;
++    int64_t position_msec;
++
++    if (pls->initial_position_applied)
++        return;
++    pls->initial_position_applied = 1;
++
++    if (c->is_live || c->initial_position <= 0)
++        return;
++
++    position_msec = av_rescale(c->initial_position, 1000, AV_TIME_BASE);
++    pls->cur_seq_no = calc_seg_no_for_position(pls, position_msec);
++    pls->initial_position_pending = pls->n_fragments == 1;
++    av_log(pls->parent, AV_LOG_VERBOSE,
++           "DASH initial position %"PRId64"ms selects segment %"PRId64
++           " for representation %s\n",
++           position_msec, pls->cur_seq_no, pls->id ? pls->id : "");
++}
++
+ static int64_t calc_min_seg_no(AVFormatContext *s, struct representation *pls)
+ {
+     DASHContext *c = s->priv_data;
+@@ -2299,6 +2368,10 @@ restart:
+         if (ret)
+             goto end;
+ 
++        /* Initialization and index data are required, but the first media
++         * request should already target the requested playback position. */
++        apply_initial_position(v);
++
+         free_fragment(&v->cur_seg);
+         v->cur_seg = get_current_fragment(v);
+         if (!v->cur_seg) {
+@@ -2480,6 +2553,20 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+             goto fail;
+     }
+ 
++    if (pls->initial_position_pending) {
++        int64_t position = c->initial_position;
++
++        pls->initial_position_pending = 0;
++        ret = avformat_seek_file(pls->ctx, -1, INT64_MIN, position,
++                                 INT64_MAX, 0);
++        if (ret < 0) {
++            av_log(s, AV_LOG_WARNING,
++                   "DASH child demuxer could not refine initial position: %s\n",
++                   av_err2str(ret));
++            ret = 0;
++        }
++    }
++
+ fail:
+     if (ret < 0)
+         close_demux_for_component(pls);
+@@ -2812,9 +2899,6 @@ static int dash_close(AVFormatContext *s)
+ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags, int dry_run)
+ {
+     int ret = 0;
+-    int i = 0;
+-    int j = 0;
+-    int64_t duration = 0;
+ 
+     av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
+            seek_pos_msec, dry_run ? " (dry)" : "");
+@@ -2831,36 +2915,9 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
+ 
+     ff_format_io_close(pls->parent, &pls->input);
+ 
+-    // find the nearest fragment
+-    if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
+-        int64_t num = pls->first_seq_no;
+-        av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline start n_timelines[%d] "
+-               "last_seq_no[%"PRId64"].\n",
+-               (int)pls->n_timelines, (int64_t)pls->last_seq_no);
+-        for (i = 0; i < pls->n_timelines; i++) {
+-            if (pls->timelines[i]->starttime > 0) {
+-                duration = pls->timelines[i]->starttime;
+-            }
+-            duration += pls->timelines[i]->duration;
+-            if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+-                goto set_seq_num;
+-            }
+-            for (j = 0; j < pls->timelines[i]->repeat; j++) {
+-                duration += pls->timelines[i]->duration;
+-                num++;
+-                if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+-                    goto set_seq_num;
+-                }
+-            }
+-            num++;
+-        }
+-
+-set_seq_num:
+-        pls->cur_seq_no = num > pls->last_seq_no ? pls->last_seq_no : num;
+-        av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline end cur_seq_no[%"PRId64"].\n",
+-               (int64_t)pls->cur_seq_no);
+-    } else if (pls->fragment_duration > 0) {
+-        pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
++    if ((pls->n_timelines > 0 && pls->fragment_timescale > 0) ||
++        (pls->fragment_duration > 0 && pls->fragment_timescale > 0)) {
++        pls->cur_seq_no = calc_seg_no_for_position(pls, seek_pos_msec);
+     } else {
+         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
+         pls->cur_seq_no = pls->first_seq_no;
+@@ -2933,6 +2990,7 @@ static const AVOption dash_options[] = {
+     { "referer", "Referer for DASH sub-requests", OFFSET(referer), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     { "cookies", "Cookies for DASH sub-requests", OFFSET(cookies), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     { "headers", "HTTP headers for DASH sub-requests", OFFSET(headers), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "initial_position", "Initial playback position in AV_TIME_BASE units", OFFSET(initial_position), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, (double)INT_MAX * AV_TIME_BASE, FLAGS },
+     {NULL}
+ };
+ 
+-- 
+2.47.3
+

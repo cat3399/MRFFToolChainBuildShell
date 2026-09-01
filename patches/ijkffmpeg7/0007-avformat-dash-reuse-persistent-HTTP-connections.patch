@@ -1,0 +1,156 @@
+From 7c25957a6837c9dc51459f7db4be3e94375f7f24 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Tue, 1 Sep 2026 21:38:44 +0800
+Subject: [PATCH] avformat/dash: reuse persistent HTTP connections
+
+Keep successful HTTP inputs open across DASH requests and use ff_http_do_new_request2 for same-host URLs. Reset request-specific range endpoints when starting a new HTTP request so a bounded metadata request cannot constrain a subsequent media request. Fall back to a fresh connection when reuse is incompatible or unavailable.
+---
+ libavformat/dashdec.c | 72 ++++++++++++++++++++++++++++++++++++++-----
+ libavformat/http.c    |  1 +
+ 2 files changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 7d66c3a..c54dc84 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -19,6 +19,8 @@
+  * License along with FFmpeg; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
++#include "config_components.h"
++
+ #include <errno.h>
+ #include <libxml/parser.h>
+ #include <time.h>
+@@ -32,6 +34,7 @@
+ #include "avio_internal.h"
+ #include "dash.h"
+ #include "demux.h"
++#include "http.h"
+ #include "url.h"
+ 
+ #define INITIAL_BUFFER_SIZE 32768
+@@ -422,6 +425,30 @@ static void free_subtitle_list(DASHContext *c)
+     c->n_subtitles = 0;
+ }
+ 
++static int open_url_keepalive(AVFormatContext *s, AVIOContext **pb,
++                              const char *url, AVDictionary **options)
++{
++#if !CONFIG_HTTP_PROTOCOL
++    return AVERROR_PROTOCOL_NOT_FOUND;
++#else
++    URLContext *uc;
++    int ret;
++
++    if (!pb || !*pb)
++        return AVERROR(EINVAL);
++
++    uc = ffio_geturlcontext(*pb);
++    if (!uc)
++        return AVERROR(EINVAL);
++
++    (*pb)->eof_reached = 0;
++    ret = ff_http_do_new_request2(uc, url, options);
++    if (ret < 0)
++        ff_format_io_close(s, pb);
++    return ret;
++#endif
++}
++
+ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+                     AVDictionary **opts, AVDictionary *opts2, int *is_http)
+ {
+@@ -464,10 +491,33 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
+         return AVERROR_INVALIDDATA;
+ 
+-    av_freep(pb);
+     av_dict_copy(&tmp, *opts, 0);
+     av_dict_copy(&tmp, opts2, 0);
++
++    if (*pb && av_strstart(proto_name, "http", NULL)) {
++        ret = open_url_keepalive(s, pb, url, &tmp);
++        if (ret >= 0) {
++            av_log(s, AV_LOG_VERBOSE,
++                   "DASH reused persistent HTTP connection\n");
++            goto opened;
++        }
++        if (ret == AVERROR_EXIT)
++            goto done;
++
++        av_log(s, AV_LOG_VERBOSE,
++               "DASH persistent HTTP request failed, opening a new "
++               "connection: %s\n", av_err2str(ret));
++        /* ff_http_do_new_request2() consumes recognized options. Rebuild
++         * them before falling back to a fresh URLContext. */
++        av_dict_free(&tmp);
++        av_dict_copy(&tmp, *opts, 0);
++        av_dict_copy(&tmp, opts2, 0);
++    }
++
++    ff_format_io_close(s, pb);
+     ret = ffio_open_whitelist(pb, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp, s->protocol_whitelist, s->protocol_blacklist);
++
++opened:
+     if (ret >= 0) {
+         // update cookies on http response with setcookies.
+         char *new_cookies = NULL;
+@@ -481,6 +531,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+ 
+     }
+ 
++done:
+     av_dict_free(&tmp);
+ 
+     if (is_http)
+@@ -2216,7 +2267,8 @@ static int download_fragment(struct representation *pls, struct fragment *seg,
+     ret = 0;
+ 
+ done:
+-    ff_format_io_close(pls->parent, &pls->input);
++    if (ret < 0)
++        ff_format_io_close(pls->parent, &pls->input);
+     return ret;
+ }
+ 
+@@ -2403,14 +2455,18 @@ static int update_segmentbase_sections(struct representation *pls)
+     int64_t merged_size;
+     int ret;
+ 
+-    if (get_merged_segmentbase_range(pls, &merged_offset, &merged_size))
+-        return update_merged_segmentbase_sections(pls, merged_offset,
+-                                                  merged_size);
++    if (get_merged_segmentbase_range(pls, &merged_offset, &merged_size)) {
++        ret = update_merged_segmentbase_sections(pls, merged_offset,
++                                                 merged_size);
++    } else {
++        ret = update_init_section(pls);
++        if (ret >= 0)
++            ret = update_segmentbase_index(pls);
++    }
+ 
+-    ret = update_init_section(pls);
+     if (ret < 0)
+-        return ret;
+-    return update_segmentbase_index(pls);
++        ff_format_io_close(pls->parent, &pls->input);
++    return ret;
+ }
+ 
+ static int is_single_full_fragment_representation(struct representation *pls)
+diff --git a/libavformat/http.c b/libavformat/http.c
+index ec60bc0..687208c 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -516,6 +516,7 @@ int ff_http_do_new_request2(URLContext *h, const char *uri, AVDictionary **opts)
+     s->end_chunked_post = 0;
+     s->chunkend      = 0;
+     s->off           = 0;
++    s->end_off       = 0;
+     s->icy_data_read = 0;
+ 
+     av_free(s->location);
+-- 
+2.47.3
+

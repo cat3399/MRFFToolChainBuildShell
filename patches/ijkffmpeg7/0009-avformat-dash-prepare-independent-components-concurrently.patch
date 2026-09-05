@@ -1,0 +1,402 @@
+From 5ef9f397529f0cdeafbbbddb99a6ade13f744c22 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 5 Sep 2026 17:30:19 +0800
+Subject: [PATCH] avformat/dash: prepare independent components concurrently
+
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 661410e..330597e 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -23,12 +23,14 @@
+ 
+ #include <errno.h>
+ #include <libxml/parser.h>
++#include <stdatomic.h>
+ #include <time.h>
+ #include "libavutil/bprint.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mem.h"
+ #include "libavutil/opt.h"
+ #include "libavutil/time.h"
++#include "libavutil/thread.h"
+ #include "libavutil/parseutils.h"
+ #include "internal.h"
+ #include "avio_internal.h"
+@@ -163,8 +165,12 @@ typedef struct DASHContext {
+ 
+     int is_live;
+     AVIOInterruptCB *interrupt_callback;
++    AVIOInterruptCB io_interrupt_callback;
++    atomic_int preparation_error;
+     char *allowed_extensions;
+     AVDictionary *avio_opts;
++    AVMutex avio_opts_mutex;
++    int avio_opts_mutex_initialized;
+     char *user_agent;
+     char *referer;
+     char *cookies;
+@@ -180,13 +186,26 @@ typedef struct DASHContext {
+     int64_t initial_position;
+     int initial_position_applied;
+ 
+-    /* Flags for init section*/
+-    int is_init_section_common_video;
+-    int is_init_section_common_audio;
+-    int is_init_section_common_subtitle;
+-
+ } DASHContext;
+ 
++/* The callback outlives the preparation workers: persistent HTTP contexts
++ * retain it during playback. Never point an AVIO callback at a stack job. */
++static int dash_io_interrupt(void *opaque)
++{
++    DASHContext *c = opaque;
++
++    return atomic_load(&c->preparation_error) < 0 ||
++           ff_check_interrupt(c->interrupt_callback);
++}
++
++static void fail_preparation(DASHContext *c, int error)
++{
++    int expected = 0;
++
++    /* Preserve the original failure; peers interrupted by it report EXIT. */
++    atomic_compare_exchange_strong(&c->preparation_error, &expected, error);
++}
++
+ static int ishttp(char *url)
+ {
+     const char *proto_name = avio_find_protocol_name(url);
+@@ -458,8 +477,22 @@ static int open_url_keepalive(AVFormatContext *s, AVIOContext **pb,
+ #endif
+ }
+ 
++static int copy_io_options(DASHContext *c, AVDictionary **dst,
++                           const AVDictionary *request_options)
++{
++    int ret;
++
++    /* Only the shared option/cookie snapshot is locked, never network I/O. */
++    ff_mutex_lock(&c->avio_opts_mutex);
++    ret = av_dict_copy(dst, c->avio_opts, 0);
++    ff_mutex_unlock(&c->avio_opts_mutex);
++    if (ret < 0)
++        return ret;
++    return av_dict_copy(dst, request_options, 0);
++}
++
+ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+-                    AVDictionary **opts, AVDictionary *opts2, int *is_http)
++                    const AVDictionary *request_options, int *is_http)
+ {
+     DASHContext *c = s->priv_data;
+     AVDictionary *tmp = NULL;
+@@ -500,8 +533,9 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
+         return AVERROR_INVALIDDATA;
+ 
+-    av_dict_copy(&tmp, *opts, 0);
+-    av_dict_copy(&tmp, opts2, 0);
++    ret = copy_io_options(c, &tmp, request_options);
++    if (ret < 0)
++        goto done;
+ 
+     if (*pb && av_strstart(proto_name, "http", NULL)) {
+         ret = open_url_keepalive(s, pb, url, &tmp);
+@@ -519,12 +553,13 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
+         /* ff_http_do_new_request2() consumes recognized options. Rebuild
+          * them before falling back to a fresh URLContext. */
+         av_dict_free(&tmp);
+-        av_dict_copy(&tmp, *opts, 0);
+-        av_dict_copy(&tmp, opts2, 0);
++        ret = copy_io_options(c, &tmp, request_options);
++        if (ret < 0)
++            goto done;
+     }
+ 
+     ff_format_io_close(s, pb);
+-    ret = ffio_open_whitelist(pb, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp, s->protocol_whitelist, s->protocol_blacklist);
++    ret = ffio_open_whitelist(pb, url, AVIO_FLAG_READ, &c->io_interrupt_callback, &tmp, s->protocol_whitelist, s->protocol_blacklist);
+ 
+ opened:
+     if (ret >= 0) {
+@@ -535,7 +570,10 @@ opened:
+             av_opt_get(*pb, "cookies", AV_OPT_SEARCH_CHILDREN, (uint8_t**)&new_cookies);
+ 
+         if (new_cookies) {
+-            av_dict_set(opts, "cookies", new_cookies, AV_DICT_DONT_STRDUP_VAL);
++            ff_mutex_lock(&c->avio_opts_mutex);
++            ret = av_dict_set(&c->avio_opts, "cookies", new_cookies,
++                              AV_DICT_DONT_STRDUP_VAL);
++            ff_mutex_unlock(&c->avio_opts_mutex);
+         }
+ 
+     }
+@@ -2254,7 +2292,7 @@ static int open_input(DASHContext *c, struct representation *pls,
+     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+     av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64"\n",
+            url, seg->url_offset);
+-    ret = open_url(pls->parent, &pls->input, url, &c->avio_opts, opts, &is_http);
++    ret = open_url(pls->parent, &pls->input, url, opts, &is_http);
+     if (ret >= 0 && !is_http && seg->url_offset > 0) {
+         int64_t seek_ret = avio_seek(pls->input, seg->url_offset, SEEK_SET);
+ 
+@@ -2601,6 +2639,9 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
+     DASHContext *c = v->parent->priv_data;
+ 
+ restart:
++    if (ff_check_interrupt(&c->io_interrupt_callback))
++        return AVERROR_EXIT;
++
+     if (!v->input) {
+         /* Coalesce adjacent initialization and SegmentBase index ranges. */
+         ret = update_segmentbase_sections(v);
+@@ -2620,7 +2661,7 @@ restart:
+ 
+         ret = open_input(c, v, v->cur_seg, !v->is_segmentbase_sidx);
+         if (ret < 0) {
+-            if (ff_check_interrupt(c->interrupt_callback)) {
++            if (ff_check_interrupt(&c->io_interrupt_callback)) {
+                 ret = AVERROR_EXIT;
+                 goto end;
+             }
+@@ -2731,7 +2772,7 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+         close_demux_for_component(pls);
+     }
+ 
+-    if (ff_check_interrupt(&s->interrupt_callback)) {
++    if (ff_check_interrupt(&c->io_interrupt_callback)) {
+         ret = AVERROR_EXIT;
+         goto fail;
+     }
+@@ -2763,7 +2804,7 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+      * playback starts and amplifies I/O jitter. */
+     pls->ctx->probesize = 1024 * 4;
+     pls->ctx->max_analyze_duration = 4 * AV_TIME_BASE;
+-    pls->ctx->interrupt_callback = s->interrupt_callback;
++    pls->ctx->interrupt_callback = c->io_interrupt_callback;
+     ret = av_probe_input_buffer(&pls->pb.pub, &in_fmt, "", NULL, 0, 0);
+     if (ret < 0) {
+         av_log(s, AV_LOG_ERROR, "Error when loading first fragment of playlist\n");
+@@ -2822,20 +2863,22 @@ fail:
+     return ret;
+ }
+ 
+-static int open_demux_for_component(AVFormatContext *s, struct representation *pls)
++static int prepare_component(AVFormatContext *s, struct representation *pls)
+ {
+-    int ret = 0;
+-    int i;
+-
+     pls->parent = s;
+     pls->cur_seq_no = calc_cur_seg_no(s, pls);
+ 
+     if (!pls->last_seq_no)
+         pls->last_seq_no = calc_max_seg_no(pls, s->priv_data);
+ 
+-    ret = reopen_demux_for_component(s, pls);
+-    if (ret < 0)
+-        return ret;
++    return reopen_demux_for_component(s, pls);
++}
++
++/* Publish only after all preparation workers have joined. AVStream creation
++ * and parent metadata remain owned by the demuxing thread. */
++static int publish_component_streams(AVFormatContext *s, struct representation *pls)
++{
++    int ret, i;
+ 
+     for (i = 0; i < pls->ctx->nb_streams; i++) {
+         AVStream *st = avformat_new_stream(s, NULL);
+@@ -2910,6 +2953,106 @@ static int copy_init_section(struct representation *rep_dest, struct representat
+     return 0;
+ }
+ 
++typedef struct DASHPreparation {
++    AVFormatContext *parent;
++    struct representation **representations;
++    int count;
++    const char *type;
++} DASHPreparation;
++
++static void *prepare_component_group(void *opaque)
++{
++    DASHPreparation *job = opaque;
++    DASHContext *c = job->parent->priv_data;
++    int common_init, i, ret = 0;
++    int64_t started = av_gettime_relative();
++
++    if (!job->count)
++        return NULL;
++
++    common_init = is_common_init_section_exist(job->representations, job->count);
++    for (i = 0; i < job->count; i++) {
++        struct representation *rep = job->representations[i];
++
++        if (ff_check_interrupt(&c->io_interrupt_callback)) {
++            ret = AVERROR_EXIT;
++            break;
++        }
++        /* Representations sharing initialization stay ordered within their
++         * group; independent media types can prepare concurrently. */
++        if (i && common_init) {
++            ret = copy_init_section(rep, job->representations[0]);
++            if (ret < 0)
++                break;
++        }
++        ret = prepare_component(job->parent, rep);
++        if (ret < 0)
++            break;
++    }
++    if (ret < 0)
++        fail_preparation(c, ret);
++    av_log(job->parent, AV_LOG_INFO,
++           "DASHSTART stage=prepare_group type=%s elapsed_us=%"PRId64
++           " representations=%d ret=%d\n",
++           job->type, av_gettime_relative() - started, job->count, ret);
++    return NULL;
++}
++
++static int prepare_components(AVFormatContext *s)
++{
++    DASHContext *c = s->priv_data;
++    DASHPreparation jobs[] = {
++        { s, c->videos,    c->n_videos,    "video" },
++        { s, c->audios,    c->n_audios,    "audio" },
++        { s, c->subtitles, c->n_subtitles, "subtitle" },
++    };
++    int i, parallel = 0, ret;
++    int64_t started = av_gettime_relative();
++#if HAVE_THREADS
++    pthread_t threads[FF_ARRAY_ELEMS(jobs)];
++    int launched[FF_ARRAY_ELEMS(jobs)] = { 0 };
++    int active = !!c->n_videos + !!c->n_audios + !!c->n_subtitles;
++
++    /* VOD's manifest is immutable here. Live input can refresh that shared
++     * manifest while opening a component, so it uses the same jobs in order. */
++    parallel = !c->is_live && active > 1;
++    if (parallel) {
++        for (i = 1; i < FF_ARRAY_ELEMS(jobs); i++) {
++            if (!jobs[i].count)
++                continue;
++            ret = pthread_create(&threads[i], NULL, prepare_component_group,
++                                  &jobs[i]);
++            if (ret) {
++                fail_preparation(c, AVERROR(ret));
++                break;
++            }
++            launched[i] = 1;
++        }
++        prepare_component_group(&jobs[0]);
++        /* No job or its AVIO may outlive read_header, on success or error. */
++        for (i = 1; i < FF_ARRAY_ELEMS(jobs); i++) {
++            if (launched[i])
++                pthread_join(threads[i], NULL);
++        }
++    } else
++#endif
++    {
++        for (i = 0; i < FF_ARRAY_ELEMS(jobs); i++) {
++            prepare_component_group(&jobs[i]);
++            if (atomic_load(&c->preparation_error) < 0)
++                break;
++        }
++    }
++    if (ff_check_interrupt(c->interrupt_callback))
++        fail_preparation(c, AVERROR_EXIT);
++    ret = atomic_load(&c->preparation_error);
++    av_log(s, AV_LOG_INFO,
++           "DASHSTART stage=prepare_components elapsed_us=%"PRId64
++           " parallel=%d ret=%d\n",
++           av_gettime_relative() - started, parallel, ret);
++    return ret;
++}
++
+ static void move_metadata(AVStream *st, const char *key, char **value)
+ {
+     if (*value) {
+@@ -2928,6 +3071,12 @@ static int dash_read_header(AVFormatContext *s)
+     int i;
+ 
+     c->interrupt_callback = &s->interrupt_callback;
++    c->io_interrupt_callback = (AVIOInterruptCB) { dash_io_interrupt, c };
++    atomic_init(&c->preparation_error, 0);
++    ret = ff_mutex_init(&c->avio_opts_mutex, NULL);
++    if (ret)
++        return AVERROR(ret);
++    c->avio_opts_mutex_initialized = 1;
+ 
+     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
+         return ret;
+@@ -2958,18 +3107,14 @@ static int dash_read_header(AVFormatContext *s)
+         av_dict_set(&c->avio_opts, "seekable", "0", 0);
+     }
+ 
+-    if(c->n_videos)
+-        c->is_init_section_common_video = is_common_init_section_exist(c->videos, c->n_videos);
++    ret = prepare_components(s);
++    if (ret < 0)
++        return ret;
+ 
+-    /* Open the demuxer for video and audio components if available */
++    /* Register prepared streams in the original, deterministic order. */
+     for (i = 0; i < c->n_videos; i++) {
+         rep = c->videos[i];
+-        if (i > 0 && c->is_init_section_common_video) {
+-            ret = copy_init_section(rep, c->videos[0]);
+-            if (ret < 0)
+-                return ret;
+-        }
+-        ret = open_demux_for_component(s, rep);
++        ret = publish_component_streams(s, rep);
+ 
+         if (ret)
+             return ret;
+@@ -2977,17 +3122,9 @@ static int dash_read_header(AVFormatContext *s)
+         ++stream_index;
+     }
+ 
+-    if(c->n_audios)
+-        c->is_init_section_common_audio = is_common_init_section_exist(c->audios, c->n_audios);
+-
+     for (i = 0; i < c->n_audios; i++) {
+         rep = c->audios[i];
+-        if (i > 0 && c->is_init_section_common_audio) {
+-            ret = copy_init_section(rep, c->audios[0]);
+-            if (ret < 0)
+-                return ret;
+-        }
+-        ret = open_demux_for_component(s, rep);
++        ret = publish_component_streams(s, rep);
+ 
+         if (ret)
+             return ret;
+@@ -2995,17 +3132,9 @@ static int dash_read_header(AVFormatContext *s)
+         ++stream_index;
+     }
+ 
+-    if (c->n_subtitles)
+-        c->is_init_section_common_subtitle = is_common_init_section_exist(c->subtitles, c->n_subtitles);
+-
+     for (i = 0; i < c->n_subtitles; i++) {
+         rep = c->subtitles[i];
+-        if (i > 0 && c->is_init_section_common_subtitle) {
+-            ret = copy_init_section(rep, c->subtitles[0]);
+-            if (ret < 0)
+-                return ret;
+-        }
+-        ret = open_demux_for_component(s, rep);
++        ret = publish_component_streams(s, rep);
+ 
+         if (ret)
+             return ret;
+@@ -3184,6 +3313,8 @@ static int dash_close(AVFormatContext *s)
+     free_video_list(c);
+     free_subtitle_list(c);
+     av_dict_free(&c->avio_opts);
++    if (c->avio_opts_mutex_initialized)
++        ff_mutex_destroy(&c->avio_opts_mutex);
+     av_freep(&c->base_url);
+     av_freep(&c->user_agent);
+     av_freep(&c->referer);

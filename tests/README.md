@@ -36,3 +36,40 @@ these options because a local MPD's file AVIO cannot inherit HTTP settings.
 VOD completion must stay terminal and byte-range continuation must not restart
 a non-seekable response from byte zero. The HTTP defaults are unchanged; no
 player-level reprepare timer or retry controller is introduced.
+
+## DASH startup preparation
+
+`test_dash_startup.py` adds real, generated MPEG-4 video and AAC audio to test
+independent preparation of media types. In addition to the features above,
+enable the rawvideo demuxer, rawvideo/MPEG-4 decoders and MPEG-4 encoder in the
+native FFmpeg build. Link `dash_startup_probe.c` with the same command as
+`dash_http_probe.c`, then run:
+
+```sh
+python3 tests/test_dash_startup.py \
+  --ffmpeg "$TASK_FFMPEG_BUILD/ffmpeg" --probe /tmp/dash_startup_probe
+```
+
+Coverage: single-track input, concurrent audio/video requests, deterministic
+stream order, per-stream packet count/hash preservation, shared initialization,
+indexed initial positioning, unsupported-position acknowledgement and regular
+seek, peer failure cancellation and user cancellation. An HTTP request barrier
+proves overlap without relying solely on a small wall-clock timing difference.
+
+The ownership model follows Media3 1.8.0's independent media loading and
+serialized result publication (see
+[ChunkSampleStream](https://github.com/androidx/media/blob/1.8.0/libraries/exoplayer/src/main/java/androidx/media3/exoplayer/source/chunk/ChunkSampleStream.java)
+and
+[MergingMediaPeriod](https://github.com/androidx/media/blob/1.8.0/libraries/exoplayer/src/main/java/androidx/media3/exoplayer/source/MergingMediaPeriod.java)).
+FFmpeg's existing per-representation AVIO and child demuxer own the actual I/O.
+At most two preparation workers supplement the calling demux thread; they all
+join before streams are published or input-open returns. No worker remains
+during playback. Shared initialization stays ordered within each media type;
+live manifest refresh remains serialized. Only option/cookie snapshots are
+locked, not network reads. Failures interrupt peers through an AVIO callback
+whose lifetime is the DASH context, preserving persistent-connection safety.
+
+`DASHSTART` logs one duration per media type and one total preparation duration.
+They add no per-packet logging and can be correlated with IJK's existing
+`IJKSTART` input-open/first-frame events. Initial positioning is acknowledged by
+the exported `initial_position_applied` result, not by consumption of an option.

@@ -1,34 +1,37 @@
-From 3ee79a7388e7e1e7ecea735c02549a108896cbae Mon Sep 17 00:00:00 2001
+From 4ec889a3daa44e40efae1cd62d54c5b309fae0b3 Mon Sep 17 00:00:00 2001
 From: Codex <codex@local>
 Date: Mon, 31 Aug 2026 20:02:06 +0800
 Subject: [PATCH] avformat/dash: open at initial playback position
 
 ---
- libavformat/dashdec.c | 124 +++++++++++++++++++++++++++++++-----------
- 1 file changed, 91 insertions(+), 33 deletions(-)
+ libavformat/dashdec.c | 220 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 187 insertions(+), 33 deletions(-)
 
 diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
-index e2add325cd..587088a944 100644
+index e2add32..7396549 100644
 --- a/libavformat/dashdec.c
 +++ b/libavformat/dashdec.c
-@@ -124,6 +124,8 @@ struct representation {
+@@ -124,6 +124,10 @@ struct representation {
      int is_restart_needed;
      int is_segmentbase_sidx;
      int segmentbase_index_parsed;
++    int initial_position_evaluated;
 +    int initial_position_applied;
 +    int initial_position_pending;
++    int64_t initial_position_target;
  };
  
  typedef struct DASHContext {
-@@ -164,6 +166,7 @@ typedef struct DASHContext {
+@@ -164,6 +168,8 @@ typedef struct DASHContext {
      char *headers;
      int max_url_size;
      char *cenc_decryption_key;
 +    int64_t initial_position;
++    int initial_position_applied;
  
      /* Flags for init section*/
      int is_init_section_common_video;
-@@ -1762,6 +1765,72 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
+@@ -1762,6 +1768,120 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
      return num;
  }
  
@@ -66,6 +69,10 @@ index e2add325cd..587088a944 100644
 +               pls->fragment_timescale > 0) {
 +        int64_t position = av_rescale(position_msec,
 +                                      pls->fragment_timescale, 1000);
++
++        position = position > pls->presentation_timeoffset
++                       ? position - pls->presentation_timeoffset
++                       : 0;
 +        num += position / pls->fragment_duration;
 +    }
 +
@@ -77,31 +84,75 @@ index e2add325cd..587088a944 100644
 +    return num;
 +}
 +
++static int get_representation_presentation_origin(
++    const struct representation *pls, int64_t *origin)
++{
++    if (!pls || !origin || pls->fragment_timescale <= 0)
++        return AVERROR(EINVAL);
++
++    if (pls->n_timelines > 0 && pls->timelines && pls->timelines[0]) {
++        *origin = pls->timelines[0]->starttime;
++    } else if (pls->fragment_duration > 0) {
++        *origin = pls->presentation_timeoffset;
++    } else {
++        return AVERROR(ENOSYS);
++    }
++
++    return *origin >= 0 ? 0 : AVERROR_INVALIDDATA;
++}
++
 +static void apply_initial_position(struct representation *pls)
 +{
 +    DASHContext *c = pls->parent->priv_data;
++    int64_t origin;
++    int64_t relative_position;
++    int64_t target;
++    int64_t requested_msec;
++    int64_t origin_msec;
 +    int64_t position_msec;
 +
-+    if (pls->initial_position_applied)
++    if (pls->initial_position_evaluated)
 +        return;
-+    pls->initial_position_applied = 1;
++    pls->initial_position_evaluated = 1;
 +
 +    if (c->is_live || c->initial_position <= 0)
 +        return;
 +
-+    position_msec = av_rescale(c->initial_position, 1000, AV_TIME_BASE);
++    if (get_representation_presentation_origin(pls, &origin) < 0) {
++        av_log(pls->parent, AV_LOG_VERBOSE,
++               "DASH startup position unsupported for representation %s\n",
++               pls->id ? pls->id : "");
++        return;
++    }
++
++    relative_position = av_rescale(c->initial_position,
++                                   pls->fragment_timescale,
++                                   AV_TIME_BASE);
++    if (relative_position < 0 || origin > INT64_MAX - relative_position)
++        return;
++
++    target = origin + relative_position;
++    requested_msec = av_rescale(c->initial_position, 1000, AV_TIME_BASE);
++    origin_msec = av_rescale(origin, 1000, pls->fragment_timescale);
++    position_msec = av_rescale(target, 1000, pls->fragment_timescale);
 +    pls->cur_seq_no = calc_seg_no_for_position(pls, position_msec);
++    pls->initial_position_target =
++        av_rescale(target, AV_TIME_BASE, pls->fragment_timescale);
++    pls->initial_position_applied = 1;
 +    pls->initial_position_pending = pls->n_fragments == 1;
-+    av_log(pls->parent, AV_LOG_VERBOSE,
-+           "DASH initial position %"PRId64"ms selects segment %"PRId64
-+           " for representation %s\n",
-+           position_msec, pls->cur_seq_no, pls->id ? pls->id : "");
++    av_log(pls->parent, AV_LOG_INFO,
++           "DASH startup position: representation=%s requested=%"PRId64
++           "ms origin=%"PRId64"ms target=%"PRId64"ms segment=%"PRId64
++           " range=%"PRId64"..%"PRId64"\n",
++           pls->id ? pls->id : "", requested_msec, origin_msec,
++           position_msec, pls->cur_seq_no, pls->first_seq_no,
++           pls->last_seq_no);
 +}
 +
  static int64_t calc_min_seg_no(AVFormatContext *s, struct representation *pls)
  {
      DASHContext *c = s->priv_data;
-@@ -2299,6 +2368,10 @@ restart:
+@@ -2299,6 +2419,10 @@ restart:
          if (ret)
              goto end;
  
@@ -112,28 +163,85 @@ index e2add325cd..587088a944 100644
          free_fragment(&v->cur_seg);
          v->cur_seg = get_current_fragment(v);
          if (!v->cur_seg) {
-@@ -2480,6 +2553,20 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
+@@ -2480,6 +2604,27 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation
              goto fail;
      }
  
 +    if (pls->initial_position_pending) {
-+        int64_t position = c->initial_position;
++        int64_t position = pls->initial_position_target;
 +
 +        pls->initial_position_pending = 0;
 +        ret = avformat_seek_file(pls->ctx, -1, INT64_MIN, position,
 +                                 INT64_MAX, 0);
 +        if (ret < 0) {
 +            av_log(s, AV_LOG_WARNING,
-+                   "DASH child demuxer could not refine initial position: %s\n",
-+                   av_err2str(ret));
++                   "DASH startup position: representation=%s child-refine="
++                   "failed target=%"PRId64"us error=%s\n",
++                   pls->id ? pls->id : "", position, av_err2str(ret));
++            pls->initial_position_applied = 0;
 +            ret = 0;
++        } else {
++            av_log(s, AV_LOG_INFO,
++                   "DASH startup position: representation=%s child-refine="
++                   "applied target=%"PRId64"us\n",
++                   pls->id ? pls->id : "", position);
 +        }
 +    }
 +
  fail:
      if (ret < 0)
          close_demux_for_component(pls);
-@@ -2812,9 +2899,6 @@ static int dash_close(AVFormatContext *s)
+@@ -2515,6 +2660,16 @@ static int open_demux_for_component(AVFormatContext *s, struct representation *p
+ 
+         avpriv_set_pts_info(st, ist->pts_wrap_bits, ist->time_base.num, ist->time_base.den);
+ 
++        if (pls->initial_position_applied) {
++            int64_t origin;
++
++            if (get_representation_presentation_origin(pls, &origin) == 0) {
++                st->start_time = av_rescale_q(
++                    origin, (AVRational){ 1, pls->fragment_timescale },
++                    st->time_base);
++            }
++        }
++
+         // copy disposition
+         st->disposition = ist->disposition;
+     }
+@@ -2694,6 +2849,32 @@ static int dash_read_header(AVFormatContext *s)
+         move_metadata(rep->assoc_stream, "language", &rep->lang);
+     }
+ 
++    if (!c->is_live && c->initial_position > 0) {
++        int representation_count =
++            c->n_videos + c->n_audios + c->n_subtitles;
++
++        c->initial_position_applied = representation_count > 0;
++        for (i = 0; i < c->n_videos; i++) {
++            if (!c->videos[i]->initial_position_applied)
++                c->initial_position_applied = 0;
++        }
++        for (i = 0; i < c->n_audios; i++) {
++            if (!c->audios[i]->initial_position_applied)
++                c->initial_position_applied = 0;
++        }
++        for (i = 0; i < c->n_subtitles; i++) {
++            if (!c->subtitles[i]->initial_position_applied)
++                c->initial_position_applied = 0;
++        }
++
++        av_log(s, AV_LOG_INFO,
++               "DASH startup position: requested=%"PRId64
++               "ms result=%s representations=%d\n",
++               av_rescale(c->initial_position, 1000, AV_TIME_BASE),
++               c->initial_position_applied ? "applied" : "fallback",
++               representation_count);
++    }
++
+     return 0;
+ }
+ 
+@@ -2812,9 +2993,6 @@ static int dash_close(AVFormatContext *s)
  static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags, int dry_run)
  {
      int ret = 0;
@@ -143,7 +251,7 @@ index e2add325cd..587088a944 100644
  
      av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
             seek_pos_msec, dry_run ? " (dry)" : "");
-@@ -2831,36 +2915,9 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
+@@ -2831,36 +3009,9 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
  
      ff_format_io_close(pls->parent, &pls->input);
  
@@ -183,11 +291,13 @@ index e2add325cd..587088a944 100644
      } else {
          av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
          pls->cur_seq_no = pls->first_seq_no;
-@@ -2933,6 +2990,7 @@ static const AVOption dash_options[] = {
+@@ -2933,6 +3084,9 @@ static const AVOption dash_options[] = {
      { "referer", "Referer for DASH sub-requests", OFFSET(referer), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
      { "cookies", "Cookies for DASH sub-requests", OFFSET(cookies), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
      { "headers", "HTTP headers for DASH sub-requests", OFFSET(headers), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
 +    { "initial_position", "Initial playback position in AV_TIME_BASE units", OFFSET(initial_position), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, (double)INT_MAX * AV_TIME_BASE, FLAGS },
++    { "initial_position_applied", "Whether the demuxer applied initial_position", OFFSET(initial_position_applied), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1,
++        FLAGS | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
      {NULL}
  };
  

@@ -1,0 +1,105 @@
+From 5044da53343f9dac1daf32e732af301ca136c0d2 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 5 Sep 2026 17:05:31 +0800
+Subject: [PATCH] avformat/dash: preserve HTTP recovery and terminal errors
+
+Forward reconnect policy and I/O timeout to every DASH request, preserve child I/O failures and failed VOD opens, and honor bounded HTTP range EOF. Keep recovery inside the existing HTTP byte-offset retry implementation.
+---
+ libavformat/dashdec.c | 29 ++++++++++++++++++++++++++++-
+ libavformat/http.c    |  5 ++++-
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/libavformat/dashdec.c b/libavformat/dashdec.c
+index 44979eb..661410e 100644
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -169,6 +169,12 @@ typedef struct DASHContext {
+     char *referer;
+     char *cookies;
+     char *headers;
++    int reconnect;
++    int reconnect_on_network_error;
++    int reconnect_delay_max;
++    int reconnect_max_retries;
++    int reconnect_delay_total_max;
++    int64_t rw_timeout;
+     int max_url_size;
+     char *cenc_decryption_key;
+     int64_t initial_position;
+@@ -2619,7 +2625,10 @@ restart:
+                 goto end;
+             }
+             av_log(v->parent, AV_LOG_WARNING, "Failed to open fragment of playlist\n");
+-            if (v->is_segmentbase_sidx)
++            /* A missing VOD fragment is a read failure, not permission to
++             * skip media (possibly all the way to a false EOF). Live windows
++             * retain their existing expired-fragment handling. */
++            if (!c->is_live)
+                 goto end;
+             v->cur_seq_no++;
+             goto restart;
+@@ -2931,6 +2940,12 @@ static int dash_read_header(AVFormatContext *s)
+     av_dict_set(&c->avio_opts, "cookies", c->cookies, 0);
+     av_dict_set(&c->avio_opts, "headers", c->headers, 0);
+     av_dict_set(&c->avio_opts, "multiple_requests", "1", AV_DICT_DONT_OVERWRITE);
++    av_dict_set_int(&c->avio_opts, "reconnect", c->reconnect, 0);
++    av_dict_set_int(&c->avio_opts, "reconnect_on_network_error", c->reconnect_on_network_error, 0);
++    av_dict_set_int(&c->avio_opts, "reconnect_delay_max", c->reconnect_delay_max, 0);
++    av_dict_set_int(&c->avio_opts, "reconnect_max_retries", c->reconnect_max_retries, 0);
++    av_dict_set_int(&c->avio_opts, "reconnect_delay_total_max", c->reconnect_delay_total_max, 0);
++    av_dict_set_int(&c->avio_opts, "rw_timeout", c->rw_timeout, 0);
+ 
+     if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
+         return ret;
+@@ -3139,6 +3154,11 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
+             pkt->stream_index = cur->stream_index;
+             return 0;
+         }
++        /* The child demuxer may translate an I/O failure into EOF or invalid
++         * media. The MPD's AVIO cannot report an error from this custom AVIO.
++         * Preserve the transport result before considering segment rollover. */
++        if (cur->pb.pub.error < 0 && cur->pb.pub.error != AVERROR_EOF)
++            return cur->pb.pub.error;
+         if (cur->is_restart_needed) {
+             cur->cur_seg_offset = 0;
+             cur->init_sec_buf_read_offset = 0;
+@@ -3266,6 +3286,13 @@ static const AVOption dash_options[] = {
+     { "referer", "Referer for DASH sub-requests", OFFSET(referer), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     { "cookies", "Cookies for DASH sub-requests", OFFSET(cookies), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
+     { "headers", "HTTP headers for DASH sub-requests", OFFSET(headers), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS },
++    { "reconnect", "Reconnect DASH HTTP reads before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
++    { "reconnect_on_network_error", "Reconnect DASH HTTP connection failures", OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS },
++    { "reconnect_delay_max", "Maximum HTTP reconnect delay in seconds", OFFSET(reconnect_delay_max), AV_OPT_TYPE_INT, {.i64 = 120}, 0, UINT_MAX/1000/1000, FLAGS },
++    { "reconnect_max_retries", "Maximum HTTP reconnect attempts", OFFSET(reconnect_max_retries), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS },
++    { "reconnect_delay_total_max", "Maximum total HTTP reconnect delay in seconds", OFFSET(reconnect_delay_total_max), AV_OPT_TYPE_INT, {.i64 = 256}, 0, UINT_MAX/1000/1000, FLAGS },
++    { "rw_timeout", "DASH network I/O timeout in microseconds", OFFSET(rw_timeout), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, FLAGS },
++    { "timeout", "Alias for rw_timeout", OFFSET(rw_timeout), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, FLAGS },
+     { "initial_position", "Initial playback position in AV_TIME_BASE units", OFFSET(initial_position), AV_OPT_TYPE_INT64, {.i64 = -1}, -1, (double)INT_MAX * AV_TIME_BASE, FLAGS },
+     { "initial_position_applied", "Whether the demuxer applied initial_position", OFFSET(initial_position_applied), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1,
+         FLAGS | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
+diff --git a/libavformat/http.c b/libavformat/http.c
+index 687208c..538bb9d 100644
+--- a/libavformat/http.c
++++ b/libavformat/http.c
+@@ -1748,6 +1748,7 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+     read_ret = http_buf_read(h, buf, size);
+     while (read_ret < 0) {
+         uint64_t target = h->is_streamed ? 0 : s->off;
++        uint64_t target_end = s->end_off ? s->end_off : s->filesize;
+ 
+         if (read_ret == AVERROR_EXIT)
+             break;
+@@ -1755,7 +1756,9 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
+         if (h->is_streamed && !s->reconnect_streamed)
+             break;
+ 
+-        if (!(s->reconnect && s->filesize > 0 && s->off < s->filesize) &&
++        /* A completed Range response is EOF even if the resource is larger.
++         * Reconnecting here would repeatedly seek to the same range end. */
++        if (!(s->reconnect && target_end > 0 && s->off < target_end) &&
+             !(s->reconnect_at_eof && read_ret == AVERROR_EOF))
+             break;
+ 
+-- 
+2.47.3
+
